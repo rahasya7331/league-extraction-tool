@@ -51,7 +51,7 @@ for _d in (CDTBHashes.local_dir, CustomHashes.local_dir, "./pref/hashes/extracte
     os.makedirs(_d, exist_ok=True)
 
 DEFAULT_LEAGUE = r"C:\Riot Games\League of Legends"
-DEFAULT_OUT    = r"C:\Users\rahasya\Desktop\Extracted"
+DEFAULT_OUT = str(Path.home() / "Desktop" / "Extracted")
 
 CHROMA_COLORS = {
     "rose quartz": "#e01da4", "lapis lazuli": "#26619c",
