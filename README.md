@@ -102,7 +102,7 @@ Extracted/
 └── Star Guardian Ahri - Sapphire.fantome   ← chroma
 ```
 
-`.fantome` dosyalarını [**cslol-manager**](https://github.com/LeagueToolkit/cslol-manager) ile yükleyebilirsin.
+`.fantome` dosyalarını [**cslol-manager**] veya [**League Toolkit**] ile yükleyebilirsin.
 
 ***
 
@@ -176,6 +176,5 @@ Bu proje **[bettie9/league-skin-fantome-builder](https://github.com/bettie9/leag
 
 <div align="center">
 
-Made with ❤️ by **[kick.com/rahasya](https://kick.com/rahasya)**
 
 </div>
