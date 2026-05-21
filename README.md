@@ -3,15 +3,14 @@
 # 🎴 Rahasya Extraction Tool
 
 **League of Legends skinlerini `.fantome` mod dosyasına çeviren interaktif araç.**
-CS (cslol-manager) ile direkt kullanılabilir.
 
-[![kick](https://img.shields.io/badge/kick-rahasya-53FC18?style=for-the-badge&logo=kick&logoColor=white)](https://kick.com/rahasya)
-[![python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+[
+[
+[
 
 </div>
 
----
+***
 
 ## ✨ Özellikler
 
@@ -21,7 +20,7 @@ CS (cslol-manager) ile direkt kullanılabilir.
 - 📁 `.fantome` dosyaları direkt seçilen klasöre çıkar, alt klasör açılmaz
 - ⚡ Hash'ler ilk çalıştırmada indirilir, sonraki açılışlar önbellekten hızlı yüklenir
 
----
+***
 
 ## 📋 Gereksinimler
 
@@ -30,7 +29,7 @@ CS (cslol-manager) ile direkt kullanılabilir.
 | **Python 3.10+** | [python.org](https://www.python.org/downloads/) — kurulumda **"Add to PATH"** seçeneğini işaretle |
 | **League of Legends** | Kurulu olması yeterli, açık olmasına gerek yok |
 
----
+***
 
 ## 🚀 Kurulum
 
@@ -55,7 +54,7 @@ python build.py
 
 > İlk açılışta hash dosyaları indirilir (~1-2 dk). Sonraki açılışlarda önbellekten yüklenir, çok daha hızlı başlar.
 
----
+***
 
 ## 🎮 Kullanım
 
@@ -91,7 +90,7 @@ Tool açıldığında bu menü gelir:
 C:\Users\<KullanıcıAdın>\Desktop\Extracted\
 ```
 
----
+***
 
 ## 📁 Çıktı formatı
 
@@ -105,7 +104,7 @@ Extracted/
 
 `.fantome` dosyalarını [**cslol-manager**](https://github.com/LeagueToolkit/cslol-manager) ile yükleyebilirsin.
 
----
+***
 
 ## ⚙️ Ayarlar
 
@@ -120,7 +119,7 @@ Varsayılan yol:
 C:\Riot Games\League of Legends
 ```
 
----
+***
 
 ## ❓ SSS
 
@@ -141,7 +140,7 @@ Menü `[2]` → Ayarlar'dan League of Legends'ın kurulu olduğu klasörü doğr
 <details>
 <summary><b>Skin extract ettim ama oyunda çalışmıyor?</b></summary>
 
-`.fantome` dosyasını [cslol-manager](https://github.com/LeagueToolkit/cslol-manager) üzerinden yüklemen gerekiyor. Direkt dosyaya çift tıklamak çalıştırmaz.
+`.fantome` dosyasını tercih ettiğin mod manager (cslol, League Toolkit vb.) üzerinden yüklemelisin. Direkt dosyaya çift tıklamak çalıştırmaz.
 
 </details>
 
@@ -152,7 +151,7 @@ Her chroma ayrı bir bin-swap gerektirdiği için ayrı `.fantome` olarak extrac
 
 </details>
 
----
+***
 
 ## 🙏 Credits & Teşekkürler
 
@@ -173,7 +172,7 @@ Bu proje **[bettie9/league-skin-fantome-builder](https://github.com/bettie9/leag
 - [CommunityDragon](https://communitydragon.org) — skin kataloğu & hash verileri
 - [Riot DataDragon](https://developer.riotgames.com) — champion & skin ID'leri
 
----
+***
 
 <div align="center">
 
