@@ -35,7 +35,7 @@ for _d in (CDTBHashes.local_dir, CustomHashes.local_dir,
 
 # ----- Config --------------------------------------------------------------
 DEFAULT_LEAGUE = r"C:\Riot Games\League of Legends"
-DEFAULT_OUT    = r"C:\Users\rahasya\Desktop\Extracted"
+DEFAULT_OUT    = str(Path.home() / "Desktop" / "Extracted")
 
 # ----- Chroma renk paleti --------------------------------------------------
 CHROMA_COLORS = {
@@ -419,7 +419,7 @@ class SkinBuilder:
         else:
             fname = safe(display)
 
-        out_dir = self.output_dir / "skins" / champ_key
+        out_dir = self.output_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{fname}.fantome"
 
