@@ -4,9 +4,6 @@
 
 **League of Legends skinlerini `.fantome` mod dosyasına çeviren interaktif araç.**
 
-[
-[
-[
 
 </div>
 
