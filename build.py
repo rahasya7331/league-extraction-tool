@@ -2,23 +2,41 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
-import time
 import urllib.request
 import zipfile
 import re
 import difflib
-import shutil
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HERE = Path(__file__).parent.resolve()
 
-# ----- Vendored LtMAO ------------------------------------------------------
+_REQUIRED = ["requests", "pyzstd", "xxhash"]
+_missing  = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
+if _missing:
+    print(f"[!] eksik paketler: {', '.join(_missing)}")
+    print("[*] yukleniyor...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *_missing])
+    print("[+] paketler kuruldu\n")
+
+
 LTMAO_SRC = HERE / "_vendor" / "LtMAO" / "src"
 if not LTMAO_SRC.exists():
-    sys.exit(f"vendored LtMAO not found at {LTMAO_SRC}")
+    print("[!] LtMAO bulunamadi.")
+    ans = input("    indirilsin mi? (e/h): ").strip().lower()
+    if ans == "e":
+        print("[*] LtMAO indiriliyor...")
+        subprocess.check_call([
+            "git", "clone", "--depth=1",
+            "https://github.com/GuiSaiUwU/LtMAO",
+            str(HERE / "_vendor" / "LtMAO")
+        ])
+        print("[+] LtMAO indirildi\n")
+    else:
+        sys.exit("LtMAO olmadan calistirilamaz.")
+
 sys.path.insert(0, str(LTMAO_SRC))
 
 WORK_DIR = HERE
@@ -29,15 +47,12 @@ from LtMAO import pyRitoFile, hash_helper  # type: ignore
 from LtMAO.hash_helper import CDTBHashes, CustomHashes, Storage  # type: ignore
 from LtMAO import no_skin  # type: ignore
 
-for _d in (CDTBHashes.local_dir, CustomHashes.local_dir,
-           "./pref/hashes/extracted_hashes"):
+for _d in (CDTBHashes.local_dir, CustomHashes.local_dir, "./pref/hashes/extracted_hashes"):
     os.makedirs(_d, exist_ok=True)
 
-# ----- Config --------------------------------------------------------------
 DEFAULT_LEAGUE = r"C:\Riot Games\League of Legends"
-DEFAULT_OUT    = str(Path.home() / "Desktop" / "Extracted")
+DEFAULT_OUT    = r"C:\Users\rahasya\Desktop\Extracted"
 
-# ----- Chroma renk paleti --------------------------------------------------
 CHROMA_COLORS = {
     "rose quartz": "#e01da4", "lapis lazuli": "#26619c",
     "tiger's eye": "#c68642", "tenfold triumph": "#b31b1b",
@@ -63,7 +78,6 @@ CHROMA_COLORS = {
     "maroon": "#6b0a0a", "rose": "#e01d6b",
 }
 
-# ----- CDragon / Riot API --------------------------------------------------
 CDRAGON_VERSIONS = "https://ddragon.leagueoflegends.com/api/versions.json"
 CDRAGON_BASE     = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default"
 CDRAGON_SUMMARY  = f"{CDRAGON_BASE}/v1/champion-summary.json"
@@ -96,7 +110,6 @@ def load_riot_data():
 
 
 def find_skin_id(champ_name: str, skin_name: str):
-    """Ana skin ID'sini döndür. Bulunamazsa None."""
     norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
     data = next((v for k, v in RIOT_DATA.items() if norm(k) == norm(champ_name)), None)
     if not data:
@@ -108,17 +121,31 @@ def find_skin_id(champ_name: str, skin_name: str):
     return official[m[0]] if m else None
 
 
+def cdragon_asset_url(asset_path: str | None) -> str | None:
+    if not asset_path:
+        return None
+    p = asset_path.strip()
+    if p.startswith("/lol-game-data/assets/"):
+        p = p.removeprefix("/lol-game-data/assets/")
+        return f"{CDRAGON_BASE}/{p.lower()}"
+    if p.startswith("/"):
+        return f"{CDRAGON_BASE}/{p.lstrip('/').lower()}"
+    return f"{CDRAGON_BASE}/{p.lower()}"
+
+
+def chroma_splash_url(champ_id: int, chroma_id: int) -> str:
+    return f"{CDRAGON_BASE}/v1/champion-chroma-images/{champ_id}/{chroma_id}.png"
+
+
 def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
     try:
         patch = http_json(CDRAGON_VERSIONS)[0]
     except Exception:
         patch = "latest"
 
-    summary = http_json(CDRAGON_SUMMARY)
-    skins   = http_json(CDRAGON_SKINS)
-    id_to_key: dict[int, str] = {
-        int(c["id"]): c["alias"] for c in summary if int(c["id"]) > 0
-    }
+    summary   = http_json(CDRAGON_SUMMARY)
+    skins     = http_json(CDRAGON_SKINS)
+    id_to_key = {int(c["id"]): c["alias"] for c in summary if int(c["id"]) > 0}
 
     target_id = None
     norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
@@ -132,7 +159,7 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
         if len(matches) == 1:
             target_id, only_key = matches[0]
         elif len(matches) > 1:
-            sys.exit(f"Bircok esleme: {', '.join(k for _,k in matches)}")
+            sys.exit(f"Bircok esleme: {', '.join(k for _, k in matches)}")
         else:
             sys.exit(f"Champion bulunamadi: '{only_key}'")
 
@@ -155,11 +182,16 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
         champ_skins = []
 
     for s in champ_skins:
-        parent_id  = int(s.get("id") or 0)
+        parent_id = int(s.get("id") or 0)
         if parent_id < 1000 or parent_id // 1000 != target_id:
             continue
         parent_num  = parent_id % 1000
         parent_name = s.get("name") or f"{only_key} skin {parent_num}"
+        parent_splash = s.get("splashPath") or s.get("uncenteredSplashPath")
+
+        if parent_num not in chroma_meta[only_key]:
+            chroma_meta[only_key][parent_num] = {"kind": "skin", "splash_path": parent_splash}
+
         for chroma in s.get("chromas") or []:
             cid_full = int(chroma["id"])
             if cid_full // 1000 != target_id:
@@ -172,7 +204,7 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
             catalog[only_key][skin_num] = cname
             chroma_meta[only_key][skin_num] = {
                 "parent_num": parent_num, "parent_name": parent_name,
-                "color": color, "kind": "chroma",
+                "color": color, "kind": "chroma", "full_id": cid_full,
             }
         for t in (s.get("questSkinInfo") or {}).get("tiers") or []:
             tid  = int(t.get("id") or 0)
@@ -185,9 +217,10 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
                 "parent_num": parent_num, "parent_name": parent_name,
                 "color": "", "kind": "form",
                 "short": str(t.get("stage") or t.get("name") or f"Stage {tnum}"),
+                "splash_path": t.get("splashPath") or t.get("uncenteredSplashPath") or parent_splash,
             }
 
-    return patch, catalog, chroma_meta
+    return patch, catalog, chroma_meta, target_id
 
 
 def _extract_color(name: str, desc: str = "") -> str:
@@ -202,49 +235,45 @@ def _extract_color(name: str, desc: str = "") -> str:
     return ""
 
 
-# ----- ANSI helpers --------------------------------------------------------
-
 def ansi_block(color_name: str) -> str:
     hex_c = CHROMA_COLORS.get(color_name.lower(), "")
     if not hex_c:
         return "\033[90m██\033[0m"
     h = hex_c.lstrip("#")
-    r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return f"\033[38;2;{r};{g};{b}m██\033[0m"
 
 
-def hyperlink(text: str, skin_id) -> str:
-    """LolValue linki — sadece gecerli (ana skin) ID varsa link olusturur."""
-    if not skin_id:
+def hyperlink(text: str, url: str | None) -> str:
+    if not url:
         return text
-    url = f"https://lolvalue.com/lol-skins/skin/{skin_id}"
     return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
 
-
-# ----- Hash / LtMAO --------------------------------------------------------
 
 def load_hashes(refresh: bool = False):
     cache = WORK_DIR / "pref" / "hashes" / "cdtb_hashes"
     if refresh and cache.exists():
-        for f in cache.iterdir(): f.unlink()
-    print("[hashes] Senkronize ediliyor...")
-    CDTBHashes.sync_all()
-    CustomHashes.read_all_hashes()
-    print(f"[hashes] Hazir — game={len(Storage.hashtables['hashes.game.txt'])}\n")
+        for f in cache.iterdir():
+            f.unlink()
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        CDTBHashes.sync_all()
+        CustomHashes.read_all_hashes()
+    print(f"[+] hashler yuklendi ({len(Storage.hashtables['hashes.game.txt'])} entry)\n")
 
-
-# ----- SkinBuilder ---------------------------------------------------------
 
 class SkinBuilder:
     def __init__(self, champions_dir: Path, output_dir: Path,
-                 catalog: dict, chroma_meta: dict):
+                 catalog: dict, chroma_meta: dict, champ_id: int = 0):
         self.champions_dir = champions_dir
         self.output_dir    = output_dir
         self.catalog       = catalog
         self.chroma_meta   = chroma_meta
+        self.champ_id      = champ_id
 
         all_game = hash_helper.Storage.hashtables["hashes.game.txt"]
-        self.skin_bin_hashes: dict[int, str] = {
+        self.skin_bin_hashes = {
             h: p for h, p in all_game.items()
             if p.lower().endswith(".bin")
             and "data/characters/" in p.lower()
@@ -255,6 +284,7 @@ class SkinBuilder:
     def list_skins(self, champ_key: str) -> list[dict]:
         wad_path = self._find_wad(champ_key)
         if not wad_path:
+            print(f"  [!] WAD bulunamadi: {champ_key}")
             return []
 
         wad = pyRitoFile.wad.WAD().read(str(wad_path))
@@ -282,8 +312,8 @@ class SkinBuilder:
         names  = self.catalog.get(champ_key, {})
         cmap   = self.chroma_meta.get(champ_key, {})
         skips  = no_skin.SKIPS.get(champ_lower)
+        result = []
 
-        result: list[dict] = []
         for num in sorted(found_nums):
             if num not in names:
                 continue
@@ -303,21 +333,24 @@ class SkinBuilder:
                 parent_name = meta.get("parent_name", "")
                 parent_num  = meta.get("parent_num")
 
-            # LolValue sadece ana skin ID'lerini tanir.
-            # Chroma / form icin parent skin'in display adini kullan.
-            if kind in ("chroma", "form") and parent_num is not None:
-                parent_display = names.get(parent_num, parent_name)
-                sid = find_skin_id(champ_key, parent_display)
+            if kind == "chroma" and meta:
+                sid = None
+                asset_id = int(meta.get("full_id") or 0)
+                spl = chroma_splash_url(self.champ_id, asset_id) if asset_id else None
             else:
                 sid = find_skin_id(champ_key, display)
+                asset_id = int(sid) if sid else 0
+                spl = cdragon_asset_url(meta.get("splash_path") if meta else None)
 
             result.append({
-                "num":         num,
-                "display":     display,
-                "kind":        kind,
-                "color":       color,
+                "num": num,
+                "display": display,
+                "kind": kind,
+                "color": color,
                 "parent_name": parent_name,
-                "skin_id":     sid,
+                "parent_num": parent_num,
+                "skin_id": sid,
+                "splash": spl,
             })
         return result
 
@@ -372,9 +405,11 @@ class SkinBuilder:
                     scdp_h = entry.hash
                     for f in entry.data:
                         if f.hash == hash_helper.Storage.bin_hashes["mResourceResolver"]:
-                            rr_h = f.data; break
+                            rr_h = f.data
+                            break
                 elif entry.type == hash_helper.Storage.bin_hashes["ResourceResolver"]:
-                    if rr_h is None: rr_h = entry.hash
+                    if rr_h is None:
+                        rr_h = entry.hash
             if scdp_h:
                 char_s0_hashes[char] = (scdp_h, rr_h)
                 char_s0_bins[char]   = s0
@@ -385,7 +420,8 @@ class SkinBuilder:
 
         num     = skin_info["num"]
         display = skin_info["display"]
-        patched: list[tuple[str, bytes]] = []
+        patched = []
+
         for char, info in characters.items():
             if num not in info["skinN"] or char not in char_s0_hashes:
                 continue
@@ -419,42 +455,39 @@ class SkinBuilder:
         else:
             fname = safe(display)
 
-        out_dir = self.output_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{fname}.fantome"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.output_dir / f"{fname}.fantome"
 
-        fantome_meta = {
-            "Name":        display,
-            "Author":      "kick.com/rahasya",
-            "Version":     "1.0.0",
-            "Description": "Extracted by kick.com/rahasya via Sunshine.",
-        }
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
-            zf.writestr("META/info.json", json.dumps(fantome_meta, indent=2))
+            zf.writestr("META/info.json", json.dumps({
+                "Name": display, "Author": "kick.com/rahasya",
+                "Version": "1.0.0",
+                "Description": "Extracted by kick.com/rahasya via Sunshine.",
+            }, indent=2))
             for inner, data in patched:
                 zf.writestr(f"WAD/{wad_path.name}/{inner}", data)
 
         return out_path
 
     def _find_wad(self, champ_key: str) -> Path | None:
-        candidates = list(self.champions_dir.glob(f"{champ_key}.wad.client"))
-        if not candidates:
-            for w in self.champions_dir.glob("*.wad.client"):
-                if w.name.split(".",1)[0].lower() == champ_key.lower():
-                    candidates.append(w); break
-        return candidates[0] if candidates else None
+        target = f"{champ_key}.wad.client".lower()
+        for w in self.champions_dir.glob("*.wad.client"):
+            if w.name.lower() == target:
+                return w
+        return None
 
-
-# ----- Bin helpers ---------------------------------------------------------
 
 def _read_bin(data: bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
-        tf.write(data); tmp = tf.name
+        tf.write(data)
+        tmp = tf.name
     try:
         return pyRitoFile.bin.BIN().read(tmp)
     finally:
-        try: os.unlink(tmp)
-        except OSError: pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _patch_bin(char_lower, skin_bin, skin0_bin, skin0_scdp, skin0_rr):
@@ -468,21 +501,27 @@ def _patch_bin(char_lower, skin_bin, skin0_bin, skin0_scdp, skin0_rr):
         if e.type == SCDP:
             scdp = e
             for f in e.data:
-                if f.hash == MRR: mrr = f; break
+                if f.hash == MRR:
+                    mrr = f
+                    break
         elif e.type == RR:
             rr = e
     if not scdp:
         raise RuntimeError("no SCDP")
 
     scdp.hash = skin0_scdp
-    if rr and skin0_rr:  rr.hash  = skin0_rr
-    if mrr and skin0_rr: mrr.data = skin0_rr
+    if rr and skin0_rr:
+        rr.hash = skin0_rr
+    if mrr and skin0_rr:
+        mrr.data = skin0_rr
 
     for f in scdp.data or []:
-        if f.type != pyRitoFile.bin.BINType.STRING: continue
-        if not isinstance(f.data, str): continue
-        try: fh = f.hash if isinstance(f.hash, int) else int(str(f.hash), 16)
-        except: continue
+        if f.type != pyRitoFile.bin.BINType.STRING or not isinstance(f.data, str):
+            continue
+        try:
+            fh = f.hash if isinstance(f.hash, int) else int(str(f.hash), 16)
+        except Exception:
+            continue
         if fh == SONF and f.data.lower().startswith(char_lower + "skin"):
             f.data = f.data[:len(char_lower)]
 
@@ -496,13 +535,14 @@ def _patch_bin(char_lower, skin_bin, skin0_bin, skin0_scdp, skin0_rr):
         tmp = tf.name
     try:
         skin_bin.write(tmp)
-        with open(tmp, "rb") as f: return f.read()
+        with open(tmp, "rb") as f:
+            return f.read()
     finally:
-        try: os.unlink(tmp)
-        except OSError: pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
-
-# ----- Interactive UI ------------------------------------------------------
 
 CONFIG = {
     "league": DEFAULT_LEAGUE,
@@ -514,25 +554,23 @@ def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def get_champ_list(champions_dir: Path) -> list[str]:
-    return sorted(
-        w.name.split(".", 1)[0]
-        for w in champions_dir.glob("*.wad.client")
-        if w.name.count(".") == 2 and "_" not in w.name.split(".", 1)[0]
-    )
-
-
 def pick_champion(champions_dir: Path) -> str | None:
-    all_champs = get_champ_list(champions_dir)
+    all_champs = sorted(
+        w.stem.split(".", 1)[0]
+        for w in champions_dir.glob("*.wad.client")
+        if w.name.count(".") == 2 and w.name.split(".", 1)[1] == "wad.client"
+    )
     while True:
         q = input("\n  Champion adi ('geri' = menu): ").strip()
-        if q.lower() in ("geri", "back", "b", ""): return None
-
+        if q.lower() in ("geri", "back", "b", ""):
+            return None
         norm_q = normalize(q)
         for c in all_champs:
-            if normalize(c) == norm_q: return c
+            if normalize(c) == norm_q:
+                return c
         partial = [c for c in all_champs if norm_q in normalize(c)]
-        if len(partial) == 1: return partial[0]
+        if len(partial) == 1:
+            return partial[0]
         if len(partial) > 1:
             print(f"  Birden fazla esleme: {', '.join(partial)}")
             continue
@@ -542,22 +580,21 @@ def pick_champion(champions_dir: Path) -> str | None:
 
 def show_skin_list(champ_key: str, skin_list: list[dict]) -> None:
     W = 64
-    print(f"\n  \u2554{'═'*W}\u2557")
-    print(f"  \u2551  {champ_key.upper():<{W-3}}\u2551")
-    print(f"  \u2551  {'Ctrl+Click isim -> LolValue':<{W-3}}\u2551")
-    print(f"  \u2560{'═'*W}\u2563")
+    print(f"\n  ╔{'═'*W}╗")
+    print(f"  ║  {champ_key.upper():<{W-3}}║")
+    print(f"  ║  {'Ctrl+Click isim -> CDragon Splash':<{W-3}}║")
+    print(f"  ╠{'═'*W}╣")
 
     max_n     = max((len(s["display"]) for s in skin_list), default=10)
     last_kind = None
 
     for i, s in enumerate(skin_list, 1):
         if last_kind and last_kind != s["kind"]:
-            print(f"  \u2560{'─'*W}\u2563")
+            print(f"  ╠{'─'*W}╣")
         last_kind = s["kind"]
 
-        num   = f"[{i:>2}]"
         name  = s["display"].ljust(max_n)
-        link  = hyperlink(name, s["skin_id"])
+        link  = hyperlink(name, s.get("splash"))
         color = s["color"]
         block = ansi_block(color.lower()) if color else "\033[90m──\033[0m"
         if color:
@@ -566,13 +603,13 @@ def show_skin_list(champ_key: str, skin_list: list[dict]) -> None:
             label = "\033[35mform\033[0m"
         else:
             label = "\033[36mskin\033[0m"
-        print(f"  \u2551 {num} {link} {block} {label}")
+        print(f"  ║ [{i:>2}] {link} {block} {label}")
 
     all_n = len(skin_list) + 1
-    print(f"  \u2560{'═'*W}\u2563")
-    print(f"  \u2551 [{all_n:>2}] Tumunu Build Et{'':<{W-20}}\u2551")
-    print(f"  \u2551 [ 0] Geri{'':<{W-10}}\u2551")
-    print(f"  \u255a{'═'*W}\u255d")
+    print(f"  ╠{'═'*W}╣")
+    print(f"  ║ [{all_n:>2}] Tumunu Build Et{'':<{W-20}}║")
+    print(f"  ║ [ 0] Geri{'':<{W-10}}║")
+    print(f"  ╚{'═'*W}╝")
 
 
 def parse_selection(sel: str, max_n: int) -> list[int] | None:
@@ -583,8 +620,7 @@ def parse_selection(sel: str, max_n: int) -> list[int] | None:
         if "-" in sel:
             a, b = sel.split("-", 1)
             return list(range(int(a.strip())-1, int(b.strip())))
-        n = int(sel)
-        return [n-1]
+        return [int(sel)-1]
     except ValueError:
         return None
 
@@ -600,7 +636,8 @@ def process_champion(builder: SkinBuilder, champ_key: str) -> None:
         show_skin_list(champ_key, skin_list)
         all_n = len(skin_list) + 1
         sel   = input("\n  Secim (ornek: 1 / 1,3,5 / 2-6): ").strip()
-        if sel == "0": break
+        if sel == "0":
+            break
 
         to_build: list[dict] = []
         if sel == str(all_n):
@@ -608,29 +645,30 @@ def process_champion(builder: SkinBuilder, champ_key: str) -> None:
         else:
             indices = parse_selection(sel, len(skin_list))
             if indices is None:
-                print("  [!] Gecersiz secim."); continue
+                print("  [!] Gecersiz secim.")
+                continue
             for idx in indices:
                 if 0 <= idx < len(skin_list):
                     to_build.append(skin_list[idx])
                 else:
                     print(f"  [!] {idx+1} gecersiz numara, atlandi.")
 
-        if not to_build: continue
+        if not to_build:
+            continue
 
         print(f"\n  Build ediliyor ({len(to_build)} skin)...")
         ok = fail = 0
         for s in to_build:
             out = builder.build_skin(champ_key, s)
             if out:
-                color = s["color"]
-                block = f"  {ansi_block(color.lower())}" if color else ""
+                block = f"  {ansi_block(s['color'].lower())}" if s["color"] else ""
                 print(f"  [+] \033[92m{out.name}\033[0m{block}")
                 ok += 1
             else:
                 print(f"  [!] Hata: skin{s['num']} ({s['display']})")
                 fail += 1
-        out_path = Path(CONFIG["out"]) / "skins" / champ_key
-        print(f"\n  \u2713 {ok} basarili" + (f", {fail} hatali" if fail else "") + f"\n  -> {out_path}\n")
+        print(f"\n  ✓ {ok} basarili" + (f", {fail} hatali" if fail else "") +
+              f"\n  -> {CONFIG['out']}\n")
 
 
 def show_settings() -> None:
@@ -640,8 +678,10 @@ def show_settings() -> None:
     c = input("  Secim: ").strip()
     if c == "1":
         p = input("  Yeni League Path: ").strip()
-        if Path(p).exists(): CONFIG["league"] = p
-        else: print("  [!] Klasor bulunamadi.")
+        if Path(p).exists():
+            CONFIG["league"] = p
+        else:
+            print("  [!] Klasor bulunamadi.")
     elif c == "2":
         p = input("  Yeni Output Path: ").strip()
         CONFIG["out"] = p
@@ -649,19 +689,19 @@ def show_settings() -> None:
 
 
 def show_menu() -> str:
-    print("\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557")
-    print("\u2551   RAHASYA EXTRACTION TOOL  v2    \u2551")
-    print("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563")
-    print("\u2551  [1] Champion Sec & Build         \u2551")
-    print("\u2551  [2] Ayarlar                      \u2551")
-    print("\u2551  [3] Hash Yenile                  \u2551")
-    print("\u2551  [4] Cikis                        \u2551")
-    print("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d")
+    print("\n╔═════════════════════════════════════╗")
+    print("║   RAHASYA EXTRACTION TOOL  v2    ║")
+    print("╠═════════════════════════════════════╣")
+    print("║  [1] Champion Sec & Build         ║")
+    print("║  [2] Ayarlar                      ║")
+    print("║  [3] Hash Yenile                  ║")
+    print("║  [4] Cikis                        ║")
+    print("╚═════════════════════════════════════╝")
     return input("  > ").strip()
 
 
 def main():
-    os.system("")  # Windows ANSI
+    os.system("")
     print("=" * 43)
     print("  Rahasya Extraction Tool  v2")
     print("  kick.com/rahasya")
@@ -672,8 +712,10 @@ def main():
     ap.add_argument("--out",    default=None)
     ap.add_argument("--refresh-hashes", action="store_true")
     args, _ = ap.parse_known_args()
-    if args.league: CONFIG["league"] = args.league
-    if args.out:    CONFIG["out"]    = args.out
+    if args.league:
+        CONFIG["league"] = args.league
+    if args.out:
+        CONFIG["out"] = args.out
 
     load_riot_data()
     load_hashes(args.refresh_hashes)
@@ -690,9 +732,10 @@ def main():
                 continue
             out_dir.mkdir(parents=True, exist_ok=True)
             champ = pick_champion(champions_dir)
-            if not champ: continue
-            patch, catalog, chroma_meta = fetch_catalog(champ)
-            builder = SkinBuilder(champions_dir, out_dir, catalog, chroma_meta)
+            if not champ:
+                continue
+            patch, catalog, chroma_meta, champ_id = fetch_catalog(champ)
+            builder = SkinBuilder(champions_dir, out_dir, catalog, chroma_meta, champ_id)
             process_champion(builder, champ)
 
         elif choice == "2":
@@ -704,6 +747,7 @@ def main():
         elif choice == "4":
             print("\n  Cikiliyor...\n")
             break
+
         else:
             print("  [!] Gecersiz secim.")
 
