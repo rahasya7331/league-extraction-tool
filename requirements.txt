@@ -1,5 +1,0 @@
-# Bu tool LtMAO'ya baglidir.
-# Asagidaki komutla yukle:
-#   git clone --depth=1 https://github.com/GuiSaiUwU/LtMAO _vendor/LtMAO
-#
-# Ekstra PyPI paketi gerekmez, LtMAO standart kutuphaneleri kullanir.
