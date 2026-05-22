@@ -3,7 +3,6 @@
 # 🎴 Rahasya Extraction Tool
 
 **League of Legends skinlerini `.fantome` mod dosyasına çeviren interaktif araç.**  
-CS (cslol-manager) ile direkt kullanılabilir.
 
 [![kick](https://img.shields.io/badge/kick-rahasya-53FC18?style=for-the-badge&logo=kick&logoColor=white)](https://kick.com/rahasya)
 [![python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
