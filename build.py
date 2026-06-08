@@ -14,7 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).parent.resolve()
 
 _REQUIRED = ["requests", "pyzstd", "xxhash"]
-_missing  = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
+_missing = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
 if _missing:
     print(f"[!] eksik paketler: {', '.join(_missing)}")
     print("[*] yukleniyor...")
@@ -84,12 +84,29 @@ CDRAGON_SUMMARY  = f"{CDRAGON_BASE}/v1/champion-summary.json"
 CDRAGON_SKINS    = f"{CDRAGON_BASE}/v1/skins.json"
 
 RIOT_DATA: dict = {}
+_SPLASH_CACHE: dict[str, bytes | None] = {}
 
 
 def http_json(url: str):
     req = urllib.request.Request(url, headers={"User-Agent": "RahasyaExtractionTool/0.2"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+
+def http_bytes(url: str | None) -> bytes | None:
+    if not url:
+        return None
+    if url in _SPLASH_CACHE:
+        return _SPLASH_CACHE[url]
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "RahasyaExtractionTool/0.2"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+    except Exception as e:
+        print(f"      · splash indirilemedi: {e}")
+        data = None
+    _SPLASH_CACHE[url] = data
+    return data
 
 
 def load_riot_data():
@@ -137,7 +154,7 @@ def chroma_splash_url(champ_id: int, chroma_id: int) -> str:
     return f"{CDRAGON_BASE}/v1/champion-chroma-images/{champ_id}/{chroma_id}.png"
 
 
-def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
+def fetch_catalog(only_key: str) -> tuple[str, dict, dict, int]:
     try:
         patch = http_json(CDRAGON_VERSIONS)[0]
     except Exception:
@@ -190,7 +207,9 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
         parent_splash = s.get("splashPath") or s.get("uncenteredSplashPath")
 
         if parent_num not in chroma_meta[only_key]:
-            chroma_meta[only_key][parent_num] = {"kind": "skin", "splash_path": parent_splash}
+            chroma_meta[only_key][parent_num] = {
+                "kind": "skin", "splash_path": parent_splash
+            }
 
         for chroma in s.get("chromas") or []:
             cid_full = int(chroma["id"])
@@ -205,6 +224,7 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict]:
             chroma_meta[only_key][skin_num] = {
                 "parent_num": parent_num, "parent_name": parent_name,
                 "color": color, "kind": "chroma", "full_id": cid_full,
+                "parent_splash_path": parent_splash,
             }
         for t in (s.get("questSkinInfo") or {}).get("tiers") or []:
             tid  = int(t.get("id") or 0)
@@ -337,6 +357,8 @@ class SkinBuilder:
                 sid = None
                 asset_id = int(meta.get("full_id") or 0)
                 spl = chroma_splash_url(self.champ_id, asset_id) if asset_id else None
+                if not spl:
+                    spl = cdragon_asset_url(meta.get("parent_splash_path"))
             else:
                 sid = find_skin_id(champ_key, display)
                 asset_id = int(sid) if sid else 0
@@ -395,10 +417,10 @@ class SkinBuilder:
                 continue
             with pyRitoFile.stream.BytesStream.reader(str(wad_path)) as bs:
                 info["skin0"].read_data(bs)
-                try:
-                    s0 = _read_bin(info["skin0"].data)
-                finally:
-                    info["skin0"].free_data()
+            try:
+                s0 = _read_bin(info["skin0"].data)
+            finally:
+                info["skin0"].free_data()
             scdp_h = rr_h = None
             for entry in s0.entries or []:
                 if entry.type == hash_helper.Storage.bin_hashes["SkinCharacterDataProperties"]:
@@ -429,10 +451,10 @@ class SkinBuilder:
             chunk = info["skinN"][num]
             with pyRitoFile.stream.BytesStream.reader(str(wad_path)) as bs:
                 chunk.read_data(bs)
-                try:
-                    skin_bin = _read_bin(chunk.data)
-                finally:
-                    chunk.free_data()
+            try:
+                skin_bin = _read_bin(chunk.data)
+            finally:
+                chunk.free_data()
             try:
                 data = _patch_bin(char, skin_bin, char_s0_bins.get(char), scdp_h, rr_h)
             except RuntimeError as e:
@@ -460,10 +482,17 @@ class SkinBuilder:
 
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
             zf.writestr("META/info.json", json.dumps({
-                "Name": display, "Author": "kick.com/rahasya",
+                "Name": display,
+                "Author": "kick.com/rahasya",
                 "Version": "1.0.0",
                 "Description": "Extracted by kick.com/rahasya via Sunshine.",
             }, indent=2))
+
+            # >>> CDragon splash'ini onizleme olarak gom (LTK/cslol META/image.png okur) <<<
+            img = http_bytes(skin_info.get("splash"))
+            if img:
+                zf.writestr("META/image.png", img)
+
             for inner, data in patched:
                 zf.writestr(f"WAD/{wad_path.name}/{inner}", data)
 
@@ -690,12 +719,12 @@ def show_settings() -> None:
 
 def show_menu() -> str:
     print("\n╔═════════════════════════════════════╗")
-    print("║   RAHASYA EXTRACTION TOOL  v2    ║")
+    print("║   RAHASYA EXTRACTION TOOL  v2       ║")
     print("╠═════════════════════════════════════╣")
-    print("║  [1] Champion Sec & Build         ║")
-    print("║  [2] Ayarlar                      ║")
-    print("║  [3] Hash Yenile                  ║")
-    print("║  [4] Cikis                        ║")
+    print("║  [1] Champion Sec & Build           ║")
+    print("║  [2] Ayarlar                        ║")
+    print("║  [3] Hash Yenile                    ║")
+    print("║  [4] Cikis                          ║")
     print("╚═════════════════════════════════════╝")
     return input("  > ").strip()
 
