@@ -5,13 +5,25 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 import re
 import difflib
+import shutil
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+# Windows konsolunda kutu cizimleri / Turkce karakterler bozulmasin
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 HERE = Path(__file__).parent.resolve()
+UA = "RahasyaExtractionTool/0.3"
 
 _REQUIRED = ["requests", "pyzstd", "xxhash"]
 _missing = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
@@ -52,6 +64,7 @@ for _d in (CDTBHashes.local_dir, CustomHashes.local_dir, "./pref/hashes/extracte
 
 DEFAULT_LEAGUE = r"C:\Riot Games\League of Legends"
 DEFAULT_OUT = str(Path.home() / "Desktop" / "Extracted")
+CONFIG_PATH = HERE / "config.json"
 
 CHROMA_COLORS = {
     "rose quartz": "#e01da4", "lapis lazuli": "#26619c",
@@ -87,10 +100,25 @@ RIOT_DATA: dict = {}
 _SPLASH_CACHE: dict[str, bytes | None] = {}
 
 
+# ----------------------------------------------------------------------------
+#  HTTP (retry + backoff)
+# ----------------------------------------------------------------------------
+def _http_get(url: str, timeout: int = 30, retries: int = 3) -> bytes:
+    last = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            if i < retries - 1:
+                time.sleep(1.2 * (i + 1))
+    raise last if last else RuntimeError("http error")
+
+
 def http_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "RahasyaExtractionTool/0.2"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    return json.loads(_http_get(url))
 
 
 def http_bytes(url: str | None) -> bytes | None:
@@ -99,9 +127,7 @@ def http_bytes(url: str | None) -> bytes | None:
     if url in _SPLASH_CACHE:
         return _SPLASH_CACHE[url]
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "RahasyaExtractionTool/0.2"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = r.read()
+        data = _http_get(url)
     except Exception as e:
         print(f"      · splash indirilemedi: {e}")
         data = None
@@ -109,13 +135,104 @@ def http_bytes(url: str | None) -> bytes | None:
     return data
 
 
+_CDRAGON_CACHE: dict[str, object] = {}
+
+
+def _cdragon_json_cached(url: str):
+    """Katalog JSON'larini bir kez indirir (extract-all 170+ kez cagirir)."""
+    if url not in _CDRAGON_CACHE:
+        _CDRAGON_CACHE[url] = http_json(url)
+    return _CDRAGON_CACHE[url]
+
+
+# ----------------------------------------------------------------------------
+#  Config (kalici ayarlar)
+# ----------------------------------------------------------------------------
+CONFIG = {
+    "league":   DEFAULT_LEAGUE,
+    "out":      DEFAULT_OUT,
+    "ltk":      "",     # bos = otomatik bul (AppData)
+    "ltk_auto": False,  # build sonrasi LTK'ya otomatik import
+}
+
+
+def load_config() -> None:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            for k in CONFIG:
+                if k in data and data[k] is not None:
+                    CONFIG[k] = data[k]
+        except Exception as e:
+            print(f"  [!] config.json okunamadi: {e}")
+
+
+def save_config() -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"  [!] config kaydedilemedi: {e}")
+
+
+def _has_champions(base: str | None) -> bool:
+    try:
+        return bool(base) and (Path(base) / "Game" / "DATA" / "FINAL" / "Champions").exists()
+    except Exception:
+        return False
+
+
+def detect_league_path() -> str | None:
+    """League kurulum yolunu otomatik bulmaya calisir (Windows registry + yaygin
+    yollar, macOS uygulama yolu)."""
+    candidates: list[str] = []
+    if sys.platform.startswith("win"):
+        try:
+            import winreg  # type: ignore
+            for hive, key, name in [
+                (winreg.HKEY_CURRENT_USER, r"Software\Riot Games\League of Legends", "Path"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Riot Games\League of Legends", "Path"),
+            ]:
+                try:
+                    with winreg.OpenKey(hive, key) as k:
+                        val, _ = winreg.QueryValueEx(k, name)
+                        if val:
+                            candidates.append(str(val))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        for d in ("C:", "D:", "E:"):
+            candidates += [
+                rf"{d}\Riot Games\League of Legends",
+                rf"{d}\Program Files\Riot Games\League of Legends",
+            ]
+    elif sys.platform == "darwin":
+        candidates += [
+            "/Applications/League of Legends.app/Contents/LoL",
+            str(Path.home() / "Applications/League of Legends.app/Contents/LoL"),
+        ]
+    for c in candidates:
+        if _has_champions(c):
+            return c
+    for c in candidates:
+        try:
+            if c and Path(c).exists():
+                return c
+        except Exception:
+            pass
+    return None
+
+
+# ----------------------------------------------------------------------------
+#  Riot / CDragon veri
+# ----------------------------------------------------------------------------
 def load_riot_data():
     global RIOT_DATA
     try:
         print("[*] Riot DataDragon yukleniyor...")
         version = http_json(CDRAGON_VERSIONS)[0]
         full = http_json(
-            f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/championFull.json"
+            "https://ddragon.leagueoflegends.com/cdn/" + version + "/data/en_US/championFull.json"
         )
         for _, info in full["data"].items():
             RIOT_DATA[info["name"].lower()] = {
@@ -156,12 +273,16 @@ def chroma_splash_url(champ_id: int, chroma_id: int) -> str:
 
 def fetch_catalog(only_key: str) -> tuple[str, dict, dict, int]:
     try:
-        patch = http_json(CDRAGON_VERSIONS)[0]
+        patch = _cdragon_json_cached(CDRAGON_VERSIONS)[0]
     except Exception:
         patch = "latest"
 
-    summary   = http_json(CDRAGON_SUMMARY)
-    skins     = http_json(CDRAGON_SKINS)
+    try:
+        summary = _cdragon_json_cached(CDRAGON_SUMMARY)
+        skins   = _cdragon_json_cached(CDRAGON_SKINS)
+    except Exception as e:
+        sys.exit(f"[!] CDragon katalogu alinamadi (internet?): {e}")
+
     id_to_key = {int(c["id"]): c["alias"] for c in summary if int(c["id"]) > 0}
 
     target_id = None
@@ -283,6 +404,9 @@ def load_hashes(refresh: bool = False):
     print(f"[+] hashler yuklendi ({len(Storage.hashtables['hashes.game.txt'])} entry)\n")
 
 
+# ----------------------------------------------------------------------------
+#  Skin builder
+# ----------------------------------------------------------------------------
 class SkinBuilder:
     def __init__(self, champions_dir: Path, output_dir: Path,
                  catalog: dict, chroma_meta: dict, champ_id: int = 0):
@@ -291,6 +415,7 @@ class SkinBuilder:
         self.catalog       = catalog
         self.chroma_meta   = chroma_meta
         self.champ_id      = champ_id
+        self._used_names: set[str] = set()
 
         all_game = hash_helper.Storage.hashtables["hashes.game.txt"]
         self.skin_bin_hashes = {
@@ -375,6 +500,15 @@ class SkinBuilder:
                 "splash": spl,
             })
         return result
+
+    def _unique_path(self, fname: str) -> Path:
+        base = fname
+        n = 2
+        while fname in self._used_names:
+            fname = f"{base} ({n})"
+            n += 1
+        self._used_names.add(fname)
+        return self.output_dir / f"{fname}.fantome"
 
     def build_skin(self, champ_key: str, skin_info: dict) -> Path | None:
         wad_path = self._find_wad(champ_key)
@@ -478,7 +612,7 @@ class SkinBuilder:
             fname = safe(display)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = self.output_dir / f"{fname}.fantome"
+        out_path = self._unique_path(fname)
 
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
             zf.writestr("META/info.json", json.dumps({
@@ -488,7 +622,7 @@ class SkinBuilder:
                 "Description": "Extracted by kick.com/rahasya via Sunshine.",
             }, indent=2))
 
-            # >>> CDragon splash'ini onizleme olarak gom (LTK/cslol META/image.png okur) <<<
+            # CDragon splash'ini onizleme olarak gom (LTK/cslol META/image.png okur)
             img = http_bytes(skin_info.get("splash"))
             if img:
                 zf.writestr("META/image.png", img)
@@ -573,38 +707,341 @@ def _patch_bin(char_lower, skin_bin, skin0_bin, skin0_scdp, skin0_rr):
             pass
 
 
-CONFIG = {
-    "league": DEFAULT_LEAGUE,
-    "out":    DEFAULT_OUT,
-}
-
-
+# ----------------------------------------------------------------------------
+#  Arama / secim yardimcilari
+# ----------------------------------------------------------------------------
 def normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def pick_champion(champions_dir: Path) -> str | None:
-    all_champs = sorted(
+def list_champ_keys(champions_dir: Path) -> list[str]:
+    return sorted(
         w.stem.split(".", 1)[0]
         for w in champions_dir.glob("*.wad.client")
         if w.name.count(".") == 2 and w.name.split(".", 1)[1] == "wad.client"
     )
+
+
+def match_champion(name: str, all_champs: list[str]) -> tuple[str | None, list[str]]:
+    """(champ_key, oneriler) doner. champ_key None ise oneriler doldurulur."""
+    norm_q = normalize(name)
+    for c in all_champs:
+        if normalize(c) == norm_q:
+            return c, []
+    partial = [c for c in all_champs if norm_q and norm_q in normalize(c)]
+    if len(partial) == 1:
+        return partial[0], []
+    if len(partial) > 1:
+        return None, partial
+    return None, difflib.get_close_matches(name, all_champs, n=3, cutoff=0.4)
+
+
+def parse_champ_csv(line: str, all_champs: list[str]) -> tuple[set[str], list[str]]:
+    """Virgulle ayrilmis sampiyon adlarini cozer.
+    (cozulenler, cozulemeyenler-oneriyle) doner."""
+    resolved: set[str] = set()
+    bad: list[str] = []
+    for q in (x.strip() for x in line.split(",")):
+        if not q:
+            continue
+        champ, alts = match_champion(q, all_champs)
+        if champ:
+            resolved.add(champ)
+        else:
+            bad.append(q + (f" (belki: {', '.join(alts)})" if alts else ""))
+    return resolved, bad
+
+
+def parse_selection(sel: str, max_n: int) -> list[int] | None:
+    sel = sel.strip()
+    try:
+        if "," in sel:
+            return [int(x.strip())-1 for x in sel.split(",") if x.strip()]
+        if "-" in sel:
+            a, b = sel.split("-", 1)
+            return list(range(int(a.strip())-1, int(b.strip())))
+        return [int(sel)-1]
+    except ValueError:
+        return None
+
+
+_KIND_RANK = {"skin": 0, "form": 1, "chroma": 2}
+_ALL_RE = re.compile(r"(\*|\b(?:all|hepsi|hepsini|tum|tumu|tümü)\b)\s*$", re.IGNORECASE)
+
+
+def _search_text(s: dict) -> str:
+    parts = [s.get("display", ""), s.get("parent_name", ""), s.get("color", "")]
+    return re.sub(r"[^a-z0-9]+", "", " ".join(p for p in parts if p).lower())
+
+
+def search_skins(query: str, skin_list: list[dict]) -> list[tuple]:
+    """Fuzzy arama. Her token, skin'in (isim + parent isim + renk) metninde
+    aranir. Sonuc: once 'skin', sonra 'form', en son 'chroma'; esitlikte daha
+    kisa isim once."""
+    tokens = [t for t in re.sub(r"[^a-z0-9]+", " ", query.lower()).split() if t]
+    if not tokens:
+        return []
+    matched = []
+    for s in skin_list:
+        hay = _search_text(s)
+        if all(tok in hay for tok in tokens):
+            disp = re.sub(r"[^a-z0-9]+", "", s.get("display", "").lower())
+            key = (_KIND_RANK.get(s.get("kind"), 3), len(disp), len(hay))
+            matched.append((key, s))
+    matched.sort(key=lambda x: x[0])
+    return matched
+
+
+def suggest_skins(query: str, skin_list: list[dict], n: int = 4) -> list[str]:
+    names: list[str] = []
+    for s in skin_list:
+        names.append(s["display"])
+        if s.get("parent_name"):
+            names.append(s["parent_name"])
+    uniq = list(dict.fromkeys(names))
+    out = difflib.get_close_matches(query, uniq, n=n, cutoff=0.4)
+    if not out:
+        # token bazli partial fallback
+        q = normalize(query)
+        out = [nm for nm in uniq if q and q in normalize(nm)][:n]
+    return out
+
+
+def _split_all_flag(query: str) -> tuple[bool, str]:
+    m = _ALL_RE.search(query)
+    if m:
+        return True, query[:m.start()].strip()
+    return False, query.strip()
+
+
+def find_best(query: str, skin_list: list[dict]) -> tuple[dict | None, list[tuple], bool]:
+    want_all, q = _split_all_flag(query)
+    if not q:
+        return None, [], want_all
+    matched = search_skins(q, skin_list)
+    if not matched:
+        return None, [], want_all
+    best = matched[0][1]
+    unambiguous = len(matched) == 1 or matched[0][0] < matched[1][0]
+    return (best if unambiguous else None), matched, want_all
+
+
+def expand_family(base: dict, skin_list: list[dict]) -> list[dict]:
+    """base skin + tum chroma/form'larini doner. base bir chroma ise once parent
+    skin'e cikar."""
+    if base.get("kind") != "skin" and base.get("parent_num") is not None:
+        parent = next((s for s in skin_list if s.get("num") == base["parent_num"]), None)
+        if parent:
+            base = parent
+    base_num = base.get("num")
+    base_disp = base.get("display", "").lower()
+    fam = [base]
+    for s in skin_list:
+        if s is base:
+            continue
+        if s.get("parent_num") == base_num or s.get("parent_name", "").lower() == base_disp:
+            fam.append(s)
+    seen, out = set(), []
+    for s in fam:
+        if s["num"] in seen:
+            continue
+        seen.add(s["num"])
+        out.append(s)
+    return out
+
+
+# ----------------------------------------------------------------------------
+#  LTK (League Toolkit) entegrasyonu
+# ----------------------------------------------------------------------------
+def ltk_dir() -> Path | None:
+    """LTK kutuphane klasorunu bulur (config > AppData otomatik)."""
+    p = str(CONFIG.get("ltk") or "").strip()
+    if p and (Path(p) / "library.json").exists():
+        return Path(p)
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cand = Path(appdata) / "dev.leaguetoolkit.manager"
+        if (cand / "library.json").exists():
+            return cand
+    return None
+
+
+def _ltk_running() -> bool:
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ltk-manager.exe"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return "ltk-manager.exe" in out.lower()
+    except Exception:
+        return False
+
+
+def ltk_import(items: list[tuple[Path, str]]) -> tuple[int, int]:
+    """(fantome_yolu, klasor_adi) listesini LTK kutuphanesine ekler:
+    archives/<id>.fantome + mods/<id>/mod.config.json + library.json kaydi.
+    Ayni isimli mod zaten varsa atlanir. (eklenen, atlanan) doner."""
+    base = ltk_dir()
+    if not base:
+        return 0, len(items)
+    lib_path = base / "library.json"
+    try:
+        lib = json.loads(lib_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  [LTK] library.json okunamadi: {e}")
+        return 0, len(items)
+
+    mods    = lib.setdefault("mods", [])
+    folders = lib.setdefault("folders", [])
+    order   = lib.setdefault("folderOrder", [])
+    root = next((f for f in folders if f.get("id") == "root"), None)
+    if root is None:
+        root = {"id": "root", "name": "", "modIds": []}
+        folders.insert(0, root)
+    if "root" not in order:
+        order.insert(0, "root")
+
+    slugify = lambda s: re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+    # mevcut modlarin sluglari (ayni skini ikinci kez eklememek icin)
+    existing: set[str] = set()
+    for m in mods:
+        cfg = base / "mods" / str(m.get("id", "")) / "mod.config.json"
+        try:
+            existing.add(json.loads(cfg.read_text(encoding="utf-8")).get("name", ""))
+        except Exception:
+            pass
+
+    def folder_for(name: str) -> dict:
+        for f in folders:
+            if str(f.get("name", "")).lower() == name.lower():
+                return f
+        f = {"id": str(uuid.uuid4()), "name": name, "modIds": []}
+        folders.append(f)
+        order.append(f["id"])
+        return f
+
+    (base / "archives").mkdir(exist_ok=True)
+    (base / "mods").mkdir(exist_ok=True)
+
+    added = skipped = 0
+    for fantome, folder_name in items:
+        try:
+            with zipfile.ZipFile(fantome) as zf:
+                info = json.loads(zf.read("META/info.json"))
+        except Exception as e:
+            print(f"  [LTK] okunamadi, atlandi: {fantome.name} ({e})")
+            skipped += 1
+            continue
+        display = str(info.get("Name") or fantome.stem)
+        slug = slugify(fantome.stem) or slugify(display)
+        if slug in existing:
+            skipped += 1
+            continue
+        mid = str(uuid.uuid4())
+        shutil.copy2(fantome, base / "archives" / f"{mid}.fantome")
+        mdir = base / "mods" / mid
+        mdir.mkdir(parents=True, exist_ok=True)
+        author = str(info.get("Author") or "").strip()
+        (mdir / "mod.config.json").write_text(json.dumps({
+            "name": slug,
+            "display_name": display,
+            "version": str(info.get("Version") or "1.0.0"),
+            "description": str(info.get("Description") or ""),
+            "authors": [author] if author else [],
+            "layers": [{"name": "base", "priority": 0,
+                        "description": "Base layer of the mod"}],
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        mods.append({"id": mid, "installedAt": now, "format": "fantome"})
+        target = folder_for(folder_name) if folder_name else root
+        target.setdefault("modIds", []).append(mid)
+        existing.add(slug)
+        added += 1
+
+    if added:
+        try:
+            shutil.copy2(lib_path, lib_path.with_suffix(".json.bak"))
+        except Exception:
+            pass
+        lib_path.write_text(json.dumps(lib, indent=2, ensure_ascii=False),
+                            encoding="utf-8")
+    return added, skipped
+
+
+_LTK_SESSION_OK: bool | None = None  # None=henuz sorulmadi, False=bu oturum atla
+
+
+def maybe_ltk_import(built: list[tuple[Path, str]]) -> None:
+    """ltk_auto acik ise build edilen dosyalari LTK'ya klasorleriyle ekler."""
+    global _LTK_SESSION_OK
+    if not CONFIG.get("ltk_auto") or not built:
+        return
+    if not ltk_dir():
+        print("  [LTK] kutuphane bulunamadi; Ayarlar'dan LTK klasorunu girin.")
+        return
+    if _LTK_SESSION_OK is False:
+        return
+    if _LTK_SESSION_OK is None and _ltk_running():
+        print("  [LTK] LTK Manager acik gorunuyor. Acikken eklenirse LTK kendi")
+        print("        listesini ustune yazabilir; en guvenlisi once kapatmak.")
+        ans = input("        Yine de devam edilsin mi? (e/h): ").strip().lower()
+        _LTK_SESSION_OK = ans == "e"
+        if not _LTK_SESSION_OK:
+            print("  [LTK] bu oturumda import atlanacak (dosyalar diskte duruyor).")
+            return
+    added, skipped = ltk_import(built)
+    folder_names = ", ".join(dict.fromkeys(f for _, f in built if f))
+    print(f"  [LTK] {added} mod eklendi"
+          + (f", {skipped} atlandi (zaten ekli)" if skipped else "")
+          + (f"  ->  klasor: {folder_names}" if folder_names else ""))
+    if added:
+        print("  [LTK] LTK'yi (yeniden) acinca listede gorunur.")
+
+
+# ----------------------------------------------------------------------------
+#  Build orkestrasyon
+# ----------------------------------------------------------------------------
+def build_many(builder: SkinBuilder, champ_key: str, to_build: list[dict]) -> tuple[int, int]:
+    print(f"\n  Build ediliyor ({len(to_build)} oge)...")
+    ok = fail = 0
+    built: list[tuple[Path, str]] = []
+    for s in to_build:
+        try:
+            out = builder.build_skin(champ_key, s)
+        except Exception as e:
+            out = None
+            print(f"  [!] Istisna: {s.get('display')} -> {e}")
+        if out:
+            block = f"  {ansi_block(s['color'].lower())}" if s["color"] else ""
+            print(f"  [+] \033[92m{out.name}\033[0m{block}")
+            built.append((out, champ_key))
+            ok += 1
+        else:
+            print(f"  [!] Hata: skin{s['num']} ({s['display']})")
+            fail += 1
+    print(f"\n  ✓ {ok} basarili" + (f", {fail} hatali" if fail else "") +
+          f"\n  -> {builder.output_dir}\n")
+    maybe_ltk_import(built)
+    return ok, fail
+
+
+# ----------------------------------------------------------------------------
+#  Interaktif UI
+# ----------------------------------------------------------------------------
+def pick_champion(champions_dir: Path) -> str | None:
+    all_champs = list_champ_keys(champions_dir)
     while True:
         q = input("\n  Champion adi ('geri' = menu): ").strip()
         if q.lower() in ("geri", "back", "b", ""):
             return None
-        norm_q = normalize(q)
-        for c in all_champs:
-            if normalize(c) == norm_q:
-                return c
-        partial = [c for c in all_champs if norm_q in normalize(c)]
-        if len(partial) == 1:
-            return partial[0]
-        if len(partial) > 1:
-            print(f"  Birden fazla esleme: {', '.join(partial)}")
-            continue
-        close = difflib.get_close_matches(q, all_champs, n=3, cutoff=0.4)
-        print(f"  [!] '{q}' bulunamadi." + (f"  Belki: {', '.join(close)}" if close else ""))
+        champ, alts = match_champion(q, all_champs)
+        if champ:
+            return champ
+        if alts:
+            print(f"  [!] '{q}' net degil. Belki: {', '.join(alts)}")
+        else:
+            print(f"  [!] '{q}' bulunamadi.")
 
 
 def show_skin_list(champ_key: str, skin_list: list[dict]) -> None:
@@ -641,17 +1078,75 @@ def show_skin_list(champ_key: str, skin_list: list[dict]) -> None:
     print(f"  ╚{'═'*W}╝")
 
 
-def parse_selection(sel: str, max_n: int) -> list[int] | None:
-    sel = sel.strip()
-    try:
-        if "," in sel:
-            return [int(x.strip())-1 for x in sel.split(",") if x.strip()]
-        if "-" in sel:
-            a, b = sel.split("-", 1)
-            return list(range(int(a.strip())-1, int(b.strip())))
-        return [int(sel)-1]
-    except ValueError:
+def parse_skin_selection(sel: str, skin_list: list[dict]) -> list[dict] | None:
+    """Skin listesinden secim parse eder. Numara (1 / 1,3 / 2-4) veya isim
+    kabul eder. Eslesme yoksa/hata varsa None, kullanici iptal ederse []."""
+    if not sel:
         return None
+    all_n = len(skin_list) + 1
+    if sel == str(all_n):
+        return skin_list[:]
+
+    if re.fullmatch(r"[0-9]+(?:\s*[,\-]\s*[0-9]+)*", sel):
+        indices = parse_selection(sel, len(skin_list))
+        if indices is None:
+            print("  [!] Gecersiz secim.")
+            return None
+        out: list[dict] = []
+        for idx in indices:
+            if 0 <= idx < len(skin_list):
+                out.append(skin_list[idx])
+            else:
+                print(f"  [!] {idx+1} gecersiz numara, atlandi.")
+        return out
+
+    best, matched, want_all = find_best(sel, skin_list)
+    if not matched:
+        sug = suggest_skins(_split_all_flag(sel)[1] or sel, skin_list)
+        print(f"  [!] '{sel}' ile eslesen skin yok."
+              + (f"  Belki: {', '.join(sug)}" if sug else ""))
+        return None
+
+    if want_all:
+        anchor = best or matched[0][1]
+        out = expand_family(anchor, skin_list)
+        fam_name = anchor["display"] if anchor.get("kind") == "skin" else anchor.get("parent_name", anchor["display"])
+        print(f"  -> \033[92m{fam_name}\033[0m + chromalar ({len(out)} oge)")
+        return out
+
+    if best:
+        print(f"  -> Secildi: \033[92m{best['display']}\033[0m"
+              + (f" ({best['color']})" if best["color"] else ""))
+        if len(matched) > 1:
+            others = ", ".join(m[1]["display"] for m in matched[1:4])
+            print(f"     (diger eslesmeler: {others}"
+                  + (" ..." if len(matched) > 4 else "") + ")")
+        return [best]
+
+    print(f"\n  '{sel}' icin birden fazla eslesme:")
+    narrowed = [m[1] for m in matched]
+    for i, s in enumerate(narrowed, 1):
+        if s["color"]:
+            extra = f" - {s['color']}"
+        elif s["kind"] != "skin":
+            extra = f" [{s['kind']}]"
+        else:
+            extra = ""
+        print(f"    [{i:>2}] {s['display']}{extra}")
+    sub = input("  Numara sec (1 / 1,3 / 2-4, bos=iptal): ").strip()
+    if not sub:
+        return []
+    idxs = parse_selection(sub, len(narrowed))
+    if idxs is None:
+        print("  [!] Gecersiz secim.")
+        return None
+    out = []
+    for idx in idxs:
+        if 0 <= idx < len(narrowed):
+            out.append(narrowed[idx])
+        else:
+            print(f"  [!] {idx+1} gecersiz numara, atlandi.")
+    return out
 
 
 def process_champion(builder: SkinBuilder, champ_key: str) -> None:
@@ -663,123 +1158,596 @@ def process_champion(builder: SkinBuilder, champ_key: str) -> None:
 
     while True:
         show_skin_list(champ_key, skin_list)
-        all_n = len(skin_list) + 1
-        sel   = input("\n  Secim (ornek: 1 / 1,3,5 / 2-6): ").strip()
+        sel = input("\n  Secim (numara: 1 / 1,3,5 / 2-6  |  isim: skin / skin chroma / skin *): ").strip()
         if sel == "0":
             break
-
-        to_build: list[dict] = []
-        if sel == str(all_n):
-            to_build = skin_list
-        else:
-            indices = parse_selection(sel, len(skin_list))
-            if indices is None:
-                print("  [!] Gecersiz secim.")
-                continue
-            for idx in indices:
-                if 0 <= idx < len(skin_list):
-                    to_build.append(skin_list[idx])
-                else:
-                    print(f"  [!] {idx+1} gecersiz numara, atlandi.")
-
+        to_build = parse_skin_selection(sel, skin_list)
         if not to_build:
             continue
+        build_many(builder, champ_key, to_build)
 
-        print(f"\n  Build ediliyor ({len(to_build)} skin)...")
-        ok = fail = 0
-        for s in to_build:
-            out = builder.build_skin(champ_key, s)
-            if out:
-                block = f"  {ansi_block(s['color'].lower())}" if s["color"] else ""
-                print(f"  [+] \033[92m{out.name}\033[0m{block}")
-                ok += 1
-            else:
-                print(f"  [!] Hata: skin{s['num']} ({s['display']})")
-                fail += 1
-        print(f"\n  ✓ {ok} basarili" + (f", {fail} hatali" if fail else "") +
-              f"\n  -> {CONFIG['out']}\n")
+
+# ----------------------------------------------------------------------------
+#  Multi-extract (coklu sampiyon/skin queue)
+# ----------------------------------------------------------------------------
+def select_skins_for_queue(champ_key: str, skin_list: list[dict],
+                           queue: list[tuple]) -> None:
+    """Bir sampiyon icin skin secimi queue'ya ekler (build etmez)."""
+    while True:
+        show_skin_list(champ_key, skin_list)
+        in_queue = sum(1 for q in queue if q[0] == champ_key)
+        print(f"\n  Queue: {len(queue)} oge ({in_queue} bu sampiyondan)")
+        sel = input("  Secim (queue'ya ekle  |  0=bitir): ").strip()
+        if sel == "0":
+            return
+        to_add = parse_skin_selection(sel, skin_list)
+        if not to_add:
+            continue
+        added = skipped = 0
+        for s in to_add:
+            key = (champ_key, s["num"])
+            if any((q[0], q[1]["num"]) == key for q in queue):
+                skipped += 1
+                continue
+            queue.append((champ_key, s))
+            added += 1
+        msg = f"  [+] {added} eklendi"
+        if skipped:
+            msg += f", {skipped} zaten queue'da"
+        msg += f"  |  toplam: {len(queue)}"
+        print(msg)
+
+
+def show_multi_queue(queue: list[tuple]) -> None:
+    if not queue:
+        print("    (queue bos)")
+        return
+    by_champ: dict[str, list[tuple]] = {}
+    for i, (ck, s) in enumerate(queue, 1):
+        by_champ.setdefault(ck, []).append((i, s))
+    for ck, items in by_champ.items():
+        print(f"    \033[96m{ck}\033[0m ({len(items)})")
+        for i, s in items:
+            extra = ""
+            if s.get("color"):
+                extra = f"  {ansi_block(s['color'].lower())} \033[93m{s['color']}\033[0m"
+            elif s.get("kind") == "form":
+                extra = "  \033[35m[form]\033[0m"
+            print(f"      [{i:>2}] {s['display']}{extra}")
+
+
+def build_multi_queue(queue: list[tuple],
+                      builders_cache: dict[str, SkinBuilder]) -> tuple[int, int]:
+    print(f"\n  Build ediliyor ({len(queue)} oge)...")
+    ok = fail = 0
+    built: list[tuple[Path, str]] = []
+    for champ_key, skin_info in queue:
+        builder = builders_cache.get(champ_key)
+        if not builder:
+            print(f"  [!] {champ_key}: builder yok, atlandi")
+            fail += 1
+            continue
+        try:
+            out = builder.build_skin(champ_key, skin_info)
+        except Exception as e:
+            out = None
+            print(f"  [!] Istisna: {champ_key} {skin_info.get('display')} -> {e}")
+        if out:
+            block = f"  {ansi_block(skin_info['color'].lower())}" if skin_info.get("color") else ""
+            print(f"  [+] {champ_key:>12} | \033[92m{out.name}\033[0m{block}")
+            built.append((out, champ_key))
+            ok += 1
+        else:
+            print(f"  [!] Hata: {champ_key} skin{skin_info['num']} ({skin_info.get('display')})")
+            fail += 1
+    print(f"\n  ✓ {ok} basarili" + (f", {fail} hatali" if fail else "") +
+          f"\n  -> {CONFIG['out']}\n")
+    maybe_ltk_import(built)
+    return ok, fail
+
+
+def split_champ_and_skin(entry: str, all_champs: list[str]) -> tuple[str | None, str]:
+    """'God Fist Lee Sin' -> ('LeeSin', 'God Fist'). Champion adini metin icinde
+    arar (en uzun kelime-grubu eslesmesi), kalan kelimeler skin sorgusu olur."""
+    words = entry.split()
+    if not words:
+        return None, ""
+    norm_map = {normalize(c): c for c in all_champs}
+    best = None  # (start, end, champ_key)
+    n = len(words)
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            span = normalize("".join(words[i:j]))
+            if span in norm_map:
+                if best is None or (j - i) > (best[1] - best[0]):
+                    best = (i, j, norm_map[span])
+    if not best:
+        return None, entry.strip()
+    i, j, champ = best
+    skin_q = " ".join(words[:i] + words[j:]).strip()
+    return champ, skin_q
+
+
+def _get_builder(champ: str, champions_dir: Path, out_dir: Path,
+                 builders_cache: dict[str, SkinBuilder],
+                 shared_names: set[str]) -> SkinBuilder:
+    if champ not in builders_cache:
+        print(f"  [{champ}] Katalog yukleniyor...")
+        _, catalog, chroma_meta, champ_id = fetch_catalog(champ)
+        b = SkinBuilder(champions_dir, out_dir, catalog, chroma_meta, champ_id)
+        b._used_names = shared_names
+        builders_cache[champ] = b
+    return builders_cache[champ]
+
+
+def resolve_bulk_entries(line: str, all_champs: list[str], champions_dir: Path,
+                         out_dir: Path, builders_cache: dict[str, SkinBuilder],
+                         shared_names: set[str]) -> tuple[list[tuple], list[str]]:
+    """Virgulle ayrilmis 'Skin Adi Champion' girdilerini cozer.
+    Or: 'Winter Wonder Zeri, Shockblade Zed Ruby, God Fist Lee Sin'.
+    (eklenecekler, hatalar) doner; eklenecekler: list[(champ_key, skin_info)]."""
+    resolved: list[tuple[str, dict]] = []
+    errors: list[str] = []
+    for entry in (e.strip() for e in line.split(",")):
+        if not entry:
+            continue
+        champ, skin_q = split_champ_and_skin(entry, all_champs)
+        if not champ:
+            sug = ", ".join(difflib.get_close_matches(entry, all_champs, n=3, cutoff=0.4))
+            errors.append(f"'{entry}': champion bulunamadi"
+                          + (f" (belki: {sug})" if sug else ""))
+            continue
+        builder = _get_builder(champ, champions_dir, out_dir, builders_cache, shared_names)
+        skin_list = builder.list_skins(champ)
+        if not skin_list:
+            errors.append(f"'{entry}': {champ} icin skin yok")
+            continue
+        if not skin_q:
+            resolved.extend((champ, s) for s in skin_list)
+            continue
+        best, matched, want_all = find_best(skin_q, skin_list)
+        if not matched:
+            sug = suggest_skins(skin_q, skin_list)
+            errors.append(f"'{entry}': '{skin_q}' eslesmedi"
+                          + (f" (belki: {', '.join(sug)})" if sug else ""))
+            continue
+        if want_all:
+            anchor = best or matched[0][1]
+            resolved.extend((champ, s) for s in expand_family(anchor, skin_list))
+        elif best:
+            resolved.append((champ, best))
+        else:
+            pick = matched[0][1]
+            resolved.append((champ, pick))
+            others = ", ".join(m[1]["display"] for m in matched[1:4])
+            errors.append(f"'{entry}': belirsiz, '{pick['display']}' secildi"
+                          + (f" (digerleri: {others})" if others else ""))
+    return resolved, errors
+
+
+def _enqueue(queue: list[tuple], items: list[tuple]) -> tuple[int, int]:
+    """items'i queue'ya ekler, mevcut (champ, num) ciftlerini atlar."""
+    added = skipped = 0
+    existing = {(q[0], q[1]["num"]) for q in queue}
+    for champ_key, s in items:
+        key = (champ_key, s["num"])
+        if key in existing:
+            skipped += 1
+            continue
+        existing.add(key)
+        queue.append((champ_key, s))
+        added += 1
+    return added, skipped
+
+
+def multi_extract_mode(champions_dir: Path, out_dir: Path) -> None:
+    """Coklu sampiyon / skin secip tek seferde build eder."""
+    queue: list[tuple[str, dict]] = []
+    builders_cache: dict[str, SkinBuilder] = {}
+    shared_names: set[str] = set()
+    all_champs = list_champ_keys(champions_dir)
+
+    while True:
+        print("\n  " + "═" * 64)
+        print(f"   MULTI-EXTRACT   ({len(queue)} oge queue'da)")
+        print("  " + "═" * 64)
+        show_multi_queue(queue)
+        print("  " + "─" * 64)
+        print("  [1] Champion ekle / skin sec")
+        print("  [2] Toplu yaz (virgullu: 'Winter Wonder Zeri, God Fist Lee Sin')")
+        print(f"  [3] Build et" + (f"  ({len(queue)} oge)" if queue else ""))
+        print("  [4] Queue'dan sil")
+        print("  [5] Queue'yu temizle")
+        print("  [0] Geri")
+        choice = input("  > ").strip()
+
+        if choice == "0":
+            if queue:
+                ans = input(f"  Queue'da {len(queue)} oge var, kaybedilecek. Cikilsin mi? (e/h): ").strip().lower()
+                if ans != "e":
+                    continue
+            return
+
+        elif choice == "1":
+            champ = pick_champion(champions_dir)
+            if not champ:
+                continue
+            builder = _get_builder(champ, champions_dir, out_dir, builders_cache, shared_names)
+            skin_list = builder.list_skins(champ)
+            if not skin_list:
+                print("  [!] Skin bulunamadi.")
+                continue
+            select_skins_for_queue(champ, skin_list, queue)
+
+        elif choice == "2":
+            line = input("\n  Skinler (virgulle ayir):\n  > ").strip()
+            if not line:
+                continue
+            resolved, errors = resolve_bulk_entries(
+                line, all_champs, champions_dir, out_dir, builders_cache, shared_names)
+            if errors:
+                print("  Uyarilar:")
+                for e in errors:
+                    print(f"    [!] {e}")
+            added, skipped = _enqueue(queue, resolved)
+            print(f"  [+] {added} eklendi"
+                  + (f", {skipped} zaten queue'da" if skipped else "")
+                  + f"  |  toplam: {len(queue)}")
+            if added:
+                ans = input("  Hemen build edilsin mi? (e/h): ").strip().lower()
+                if ans == "e":
+                    build_multi_queue(queue, builders_cache)
+                    c2 = input("  Queue temizlensin mi? (E/h): ").strip().lower()
+                    if c2 in ("", "e"):
+                        queue.clear()
+                        shared_names.clear()
+
+        elif choice == "3":
+            if not queue:
+                print("  [!] Queue bos.")
+                continue
+            build_multi_queue(queue, builders_cache)
+            ans = input("  Queue temizlensin mi? (E/h): ").strip().lower()
+            if ans in ("", "e"):
+                queue.clear()
+                shared_names.clear()
+
+        elif choice == "4":
+            if not queue:
+                print("  [!] Queue bos.")
+                continue
+            sel = input("  Silinecek numara(lar) (1 / 1,3 / 2-4): ").strip()
+            idxs = parse_selection(sel, len(queue))
+            if idxs is None:
+                print("  [!] Gecersiz secim.")
+                continue
+            for idx in sorted(set(idxs), reverse=True):
+                if 0 <= idx < len(queue):
+                    rm = queue.pop(idx)
+                    print(f"  [-] {rm[0]} - {rm[1]['display']}")
+
+        elif choice == "5":
+            if not queue:
+                print("  [!] Queue zaten bos.")
+                continue
+            queue.clear()
+            shared_names.clear()
+            print("  [+] Queue temizlendi.")
+
+        else:
+            print("  [!] Gecersiz secim.")
+
+
+# ----------------------------------------------------------------------------
+#  Extract All (tum sampiyonlar, sampiyon basina klasor)
+# ----------------------------------------------------------------------------
+def run_extract_all(champions_dir: Path, out_dir: Path, only_skins: bool,
+                    exclude: set[str] | None = None) -> int:
+    """Tum sampiyonlari tarar, her birini kendi klasorune build eder
+    (or. Extracted/Jhin/*.fantome). Var olan klasorler atlanir, yani islem
+    yarida kesilirse tekrar calistirilarak kaldigi yerden devam edilir."""
+    all_champs = list_champ_keys(champions_dir)
+    if not all_champs:
+        print("  [!] Champion WAD'i bulunamadi.")
+        return 2
+    if exclude:
+        before = len(all_champs)
+        all_champs = [c for c in all_champs if c not in exclude]
+        print(f"  · {before - len(all_champs)} sampiyon haric tutuldu: "
+              + ", ".join(sorted(exclude)))
+        if not all_champs:
+            print("  [!] Haric tutma sonrasi sampiyon kalmadi.")
+            return 2
+
+    t0 = time.time()
+    total_ok = total_fail = done_skip = 0
+    for i, champ in enumerate(all_champs, 1):
+        champ_dir = out_dir / champ
+        print(f"\n  ━━ [{i}/{len(all_champs)}] {champ} " + "━" * max(1, 44 - len(champ)))
+        try:
+            _, catalog, chroma_meta, champ_id = fetch_catalog(champ)
+        except (SystemExit, Exception) as e:
+            print(f"    [!] katalog hatasi, atlandi: {e}")
+            total_fail += 1
+            continue
+        builder = SkinBuilder(champions_dir, champ_dir, catalog, chroma_meta, champ_id)
+        try:
+            skin_list = builder.list_skins(champ)
+        except Exception as e:
+            print(f"    [!] WAD okunamadi, atlandi: {e}")
+            total_fail += 1
+            continue
+        if only_skins:
+            skin_list = [s for s in skin_list if s.get("kind") == "skin"]
+        if not skin_list:
+            print("    · cikarilacak skin yok")
+            continue
+        existing = len(list(champ_dir.glob("*.fantome"))) if champ_dir.exists() else 0
+        if existing >= len(skin_list):
+            print(f"    · zaten cikarilmis ({existing} dosya), atlandi")
+            done_skip += 1
+            continue
+        ok, fail = build_many(builder, champ, skin_list)
+        total_ok += ok
+        total_fail += fail
+
+    mins = (time.time() - t0) / 60
+    print(f"\n  ══ TAMAMLANDI ══  {total_ok} basarili, {total_fail} hatali"
+          + (f", {done_skip} sampiyon onceden hazirdi" if done_skip else "")
+          + f"  ({mins:.1f} dk)")
+    print(f"  -> {out_dir}")
+    print("  LTK: cikti klasorundeki .fantome'lari import et; arama kutusuna")
+    print("  sampiyon adini yazinca o sampiyonun tum skinleri listelenir.\n")
+    return 0 if total_fail == 0 else 1
+
+
+def extract_all_mode(champions_dir: Path, out_dir: Path) -> None:
+    all_champs = list_champ_keys(champions_dir)
+    print(f"\n  {len(all_champs)} sampiyon bulundu. Her biri kendi klasorune yazilir:")
+    print(f"    {out_dir}\\<Champion>\\<skin>.fantome")
+    print("  [1] Hepsi (skin + chroma + form)")
+    print("  [2] Sadece skinler (chroma haric)")
+    print("  [0] Iptal")
+    c = input("  > ").strip()
+    if c not in ("1", "2"):
+        return
+
+    exclude: set[str] = set()
+    line = input("  Haric tutulacak sampiyonlar (virgulle, bos = yok): ").strip()
+    if line:
+        exclude, bad = parse_champ_csv(line, all_champs)
+        for b in bad:
+            print(f"    [!] bulunamadi: {b}")
+        if bad and not exclude:
+            return
+        if exclude:
+            print(f"    -> haric: {', '.join(sorted(exclude))}")
+
+    ans = input("  Bu islem uzun surer ve binlerce dosya uretir; yarida kesilirse\n"
+                "  tekrar baslatinca kaldigi yerden devam eder. Baslasin mi? (e/h): ").strip().lower()
+    if ans != "e":
+        return
+    run_extract_all(champions_dir, out_dir, only_skins=(c == "2"), exclude=exclude)
 
 
 def show_settings() -> None:
+    ltk_path = ltk_dir()
+    ltk_show = str(ltk_path) if ltk_path else "bulunamadi (yol girin)"
+    auto = "ACIK" if CONFIG.get("ltk_auto") else "KAPALI"
     print(f"\n  1. League Path : {CONFIG['league']}")
     print(f"  2. Output Path : {CONFIG['out']}")
-    print(f"  3. Geri")
+    print(f"  3. League yolunu otomatik bul")
+    print(f"  4. LTK klasoru : {ltk_show}")
+    print(f"  5. LTK auto-import : {auto}  (build edilenler sampiyon klasoruyle LTK'ya eklenir)")
+    print(f"  6. Geri")
     c = input("  Secim: ").strip()
     if c == "1":
         p = input("  Yeni League Path: ").strip()
         if Path(p).exists():
             CONFIG["league"] = p
+            save_config()
         else:
             print("  [!] Klasor bulunamadi.")
     elif c == "2":
         p = input("  Yeni Output Path: ").strip()
         CONFIG["out"] = p
         Path(p).mkdir(parents=True, exist_ok=True)
+        save_config()
+    elif c == "3":
+        detected = detect_league_path()
+        if detected:
+            CONFIG["league"] = detected
+            save_config()
+            print(f"  [+] Bulundu: {detected}")
+        else:
+            print("  [!] Otomatik bulunamadi, manuel girin.")
+    elif c == "4":
+        p = input("  LTK kutuphane klasoru (icinde library.json olmali): ").strip()
+        if p and (Path(p) / "library.json").exists():
+            CONFIG["ltk"] = p
+            save_config()
+            print("  [+] LTK yolu kaydedildi.")
+        else:
+            print("  [!] Gecersiz: library.json bulunamadi.")
+    elif c == "5":
+        CONFIG["ltk_auto"] = not CONFIG.get("ltk_auto")
+        save_config()
+        print(f"  [+] LTK auto-import: {'ACIK' if CONFIG['ltk_auto'] else 'KAPALI'}")
+        if CONFIG["ltk_auto"] and not ltk_dir():
+            print("  [!] LTK kutuphanesi bulunamadi — 4 ile yol girin.")
+
+
+def show_how_to_use() -> None:
+    C = "\033[96m"; G = "\033[92m"; Y = "\033[93m"; D = "\033[90m"; R = "\033[0m"
+    line = C + "  " + "─" * 66 + R
+    print(f"\n{C}  ╔{'═' * 66}╗{R}")
+    print(f"{C}  ║{R}  {Y}NASIL KULLANILIR{R}{' ' * 49}{C}║{R}")
+    print(f"{C}  ╚{'═' * 66}╝{R}")
+
+    print(f"  {Y}[1] Champion Sec & Build{R}  — tek sampiyon")
+    print(f"      Sampiyon adi yaz, sonra skin listesinden sec:")
+    print(f"        numara : {G}3{R}  |  {G}1,3,5{R}  |  {G}2-6{R}")
+    print(f"        isim   : {G}skinname{R}  |  {G}skinname ruby{R}  |  {G}skinname *{R} {D}(tum chroma){R}")
+    print(f"        {G}<son numara>{R} = tumunu build,   {G}0{R} = geri")
+    print(line)
+
+    print(f"  {Y}[2] Multi-Extract{R}  — coklu sampiyon/skin, tek seferde build")
+    print(f"      {G}[1]{R} sampiyon ekle & skin sec  {D}(queue'ya atar, baska champ eklenebilir){R}")
+    print(f"      {G}[2]{R} toplu yaz: tam isimleri virgulle ayir, hepsi cikar:")
+    print(f"          {D}Winter Wonder Zeri, Shockblade Zed Ruby, Headhunter Nidalee, God Fist Lee Sin{R}")
+    print(f"      {G}[3]{R} build et   {G}[4]{R} queue'dan sil   {G}[5]{R} temizle")
+    print(line)
+
+    print(f"  {Y}[3] Extract All{R}  — tum sampiyonlar, sampiyon basina klasor")
+    print(f"      {D}Or. Extracted\\Jhin\\ icinde sadece Jhin skin+chromalari olur.{R}")
+    print(f"      {D}Istemedigin sampiyonlari haric tutabilirsin: 'zed, lee sin'.{R}")
+    print(f"      {D}Yarida kalirsa tekrar baslat, kaldigi yerden devam eder.{R}")
+    print(line)
+
+    print(f"  {Y}[4] Ayarlar{R}  — League / cikti yolu      {Y}[5] Hash Yenile{R}")
+    auto = f"{G}ACIK{R}" if CONFIG.get("ltk_auto") else f"{D}KAPALI{R}"
+    print(f"      LTK auto-import: {auto} {D}— acikken build edilen her mod,{R}")
+    print(f"      {D}LTK icinde sampiyon adli klasore otomatik eklenir (Ayarlar > 5).{R}")
+    print(f"  {D}  Cikti klasoru: {CONFIG['out']}{R}")
+    print(f"{C}  {'═' * 66}{R}")
 
 
 def show_menu() -> str:
     print("\n╔═════════════════════════════════════╗")
-    print("║   RAHASYA EXTRACTION TOOL  v2       ║")
+    print("║   RAHASYA EXTRACTION TOOL  v3       ║")
     print("╠═════════════════════════════════════╣")
     print("║  [1] Champion Sec & Build           ║")
-    print("║  [2] Ayarlar                        ║")
-    print("║  [3] Hash Yenile                    ║")
-    print("║  [4] Cikis                          ║")
+    print("║  [2] Multi-Extract (Coklu Build)    ║")
+    print("║  [3] Extract All (Tum Sampiyonlar)  ║")
+    print("║  [4] Ayarlar                        ║")
+    print("║  [5] Hash Yenile                    ║")
+    print("║  [6] Cikis                          ║")
     print("╚═════════════════════════════════════╝")
     return input("  > ").strip()
 
 
+# ----------------------------------------------------------------------------
+#  Non-interaktif CLI modu
+# ----------------------------------------------------------------------------
+def run_cli(args) -> int:
+    champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
+    if not champions_dir.exists():
+        print(f"[!] League klasoru bulunamadi: {champions_dir}")
+        return 2
+
+    all_champs = list_champ_keys(champions_dir)
+    champ, alts = match_champion(args.champion, all_champs)
+    if not champ:
+        msg = f"[!] Champion bulunamadi: '{args.champion}'"
+        if alts:
+            msg += f"  Belki: {', '.join(alts)}"
+        print(msg)
+        return 2
+
+    patch, catalog, chroma_meta, champ_id = fetch_catalog(champ)
+    builder = SkinBuilder(champions_dir, Path(CONFIG["out"]), catalog, chroma_meta, champ_id)
+    skin_list = builder.list_skins(champ)
+    if not skin_list:
+        print("[!] Skin bulunamadi.")
+        return 1
+
+    if args.list:
+        show_skin_list(champ, skin_list)
+        return 0
+
+    if args.all_skins and not args.skin:
+        ok, fail = build_many(builder, champ, skin_list)
+        return 0 if fail == 0 else 1
+
+    if not args.skin:
+        print("[!] --skin <isim> veya --all gerekli (ya da --list).")
+        return 2
+
+    best, matched, want_all = find_best(args.skin, skin_list)
+    if not matched:
+        sug = suggest_skins(_split_all_flag(args.skin)[1] or args.skin, skin_list)
+        msg = f"[!] '{args.skin}' ile eslesen skin yok."
+        if sug:
+            msg += f"  Belki: {', '.join(sug)}"
+        print(msg)
+        return 1
+
+    if want_all or args.all_skins:
+        anchor = best or matched[0][1]
+        to_build = expand_family(anchor, skin_list)
+    elif best:
+        to_build = [best]
+    else:
+        opts = ", ".join(m[1]["display"] for m in matched[:6])
+        print(f"[!] '{args.skin}' belirsiz, netlestir. Eslesmeler: {opts}")
+        return 2
+
+    ok, fail = build_many(builder, champ, to_build)
+    return 0 if fail == 0 else 1
+
+
 def main():
     os.system("")
-    print("=" * 43)
-    print("  Rahasya Extraction Tool  v2")
-    print("  kick.com/rahasya")
-    print("=" * 43)
 
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--league", default=None)
-    ap.add_argument("--out",    default=None)
-    ap.add_argument("--refresh-hashes", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="Rahasya Extraction Tool - LoL skin/chroma -> .fantome",
+        add_help=True,
+    )
+    ap.add_argument("--league", default=None, help="League of Legends kurulum yolu")
+    ap.add_argument("--out", default=None, help="Cikti klasoru")
+    ap.add_argument("--champion", default=None, help="Non-interaktif: sampiyon adi")
+    ap.add_argument("--skin", default=None, help="Non-interaktif: skin/chroma adi (or. 'skinname ruby')")
+    ap.add_argument("--all", dest="all_skins", action="store_true", help="Tum skinleri (veya --skin ile o ailenin tum chromalarini) cikar")
+    ap.add_argument("--list", action="store_true", help="Non-interaktif: skin listesini yazdir, cikma")
+    ap.add_argument("--extract-all", dest="extract_all", action="store_true",
+                    help="Tum sampiyonlari sampiyon-basina klasorlere cikar (LTK toplu import icin)")
+    ap.add_argument("--skins-only", dest="skins_only", action="store_true",
+                    help="--extract-all ile: chromalari/formlari atla, sadece skinler")
+    ap.add_argument("--exclude", default=None,
+                    help="--extract-all ile: haric tutulacak sampiyonlar (or. 'zed, lee sin')")
+    ap.add_argument("--ltk-import", dest="ltk_import", action="store_true",
+                    help="Build edilenleri LTK'ya sampiyon klasoruyle otomatik ekle")
+    ap.add_argument("--refresh-hashes", action="store_true", help="Hash tablolarini yenile")
     args, _ = ap.parse_known_args()
+
+    load_config()
     if args.league:
         CONFIG["league"] = args.league
     if args.out:
         CONFIG["out"] = args.out
+    if args.ltk_import:
+        CONFIG["ltk_auto"] = True
+    if not _has_champions(CONFIG["league"]):
+        detected = detect_league_path()
+        if detected:
+            CONFIG["league"] = detected
+
+    headless = bool(args.champion or args.list or args.extract_all)
+
+    print("=" * 43)
+    print("  Rahasya Extraction Tool  v3")
+    print("  kick.com/rahasya")
+    print("=" * 43)
 
     load_riot_data()
     load_hashes(args.refresh_hashes)
 
-    while True:
-        champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
-        out_dir       = Path(CONFIG["out"])
-        choice        = show_menu()
-
-        if choice == "1":
+    if headless:
+        if args.extract_all and not args.champion:
+            champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
             if not champions_dir.exists():
-                print(f"\n  [!] League klasoru bulunamadi: {champions_dir}")
-                print("  Ayarlar'dan (2) dogru yolu girin.\n")
-                continue
+                sys.exit(f"[!] League klasoru bulunamadi: {champions_dir}")
+            out_dir = Path(CONFIG["out"])
             out_dir.mkdir(parents=True, exist_ok=True)
-            champ = pick_champion(champions_dir)
-            if not champ:
-                continue
-            patch, catalog, chroma_meta, champ_id = fetch_catalog(champ)
-            builder = SkinBuilder(champions_dir, out_dir, catalog, chroma_meta, champ_id)
-            process_champion(builder, champ)
+            exclude: set[str] = set()
+            if args.exclude:
+                exclude, bad = parse_champ_csv(args.exclude, list_champ_keys(champions_dir))
+                if bad:
+                    sys.exit("[!] --exclude cozulemedi: " + "; ".join(bad))
+            sys.exit(run_extract_all(champions_dir, out_dir, args.skins_only, exclude))
+        sys.exit(run_cli(args))
 
-        elif choice == "2":
-            show_settings()
+    show_how_to_use()
 
-        elif choice == "3":
-            load_hashes(refresh=True)
-
-        elif choice == "4":
-            print("\n  Cikiliyor...\n")
-            break
-
-        else:
-            print("  [!] Gecersiz secim.")
-
-
-if __name__ == "__main__":
-    main()
+    while True:
+        champions_dir = Path(CONFIG["league"]) / "Game" / "DA
