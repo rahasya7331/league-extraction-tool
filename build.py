@@ -1750,4 +1750,52 @@ def main():
     show_how_to_use()
 
     while True:
-        champions_dir = Path(CONFIG["league"]) / "Game" / "DA
+        champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
+        out_dir       = Path(CONFIG["out"])
+        choice        = show_menu()
+
+        if choice == "1":
+            if not champions_dir.exists():
+                print(f"\n  [!] League klasoru bulunamadi: {champions_dir}")
+                print("  Ayarlar'dan (4) dogru yolu girin ya da otomatik bul.\n")
+                continue
+            out_dir.mkdir(parents=True, exist_ok=True)
+            champ = pick_champion(champions_dir)
+            if not champ:
+                continue
+            patch, catalog, chroma_meta, champ_id = fetch_catalog(champ)
+            builder = SkinBuilder(champions_dir, out_dir, catalog, chroma_meta, champ_id)
+            process_champion(builder, champ)
+
+        elif choice == "2":
+            if not champions_dir.exists():
+                print(f"\n  [!] League klasoru bulunamadi: {champions_dir}")
+                print("  Ayarlar'dan (4) dogru yolu girin ya da otomatik bul.\n")
+                continue
+            out_dir.mkdir(parents=True, exist_ok=True)
+            multi_extract_mode(champions_dir, out_dir)
+
+        elif choice == "3":
+            if not champions_dir.exists():
+                print(f"\n  [!] League klasoru bulunamadi: {champions_dir}")
+                print("  Ayarlar'dan (4) dogru yolu girin ya da otomatik bul.\n")
+                continue
+            out_dir.mkdir(parents=True, exist_ok=True)
+            extract_all_mode(champions_dir, out_dir)
+
+        elif choice == "4":
+            show_settings()
+
+        elif choice == "5":
+            load_hashes(refresh=True)
+
+        elif choice == "6":
+            print("\n  Cikiliyor...\n")
+            break
+
+        else:
+            print("  [!] Gecersiz secim.")
+
+
+if __name__ == "__main__":
+    main()
