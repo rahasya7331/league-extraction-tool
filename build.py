@@ -11,6 +11,7 @@ import zipfile
 import re
 import difflib
 import shutil
+import struct
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,20 +23,31 @@ try:
 except Exception:
     pass
 
-HERE = Path(__file__).parent.resolve()
 UA = "RahasyaExtractionTool/0.3"
 
-_REQUIRED = ["requests", "pyzstd", "xxhash"]
-_missing = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
-if _missing:
-    print(f"[!] eksik paketler: {', '.join(_missing)}")
-    print("[*] yukleniyor...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *_missing])
-    print("[+] paketler kuruldu\n")
+# .exe (PyInstaller) ile script modunu ayir:
+#   FROZEN ise -> pip/git calismaz; LtMAO + paketler gomulu, _vendor BUNDLE icinde.
+#   Kalici dosyalar (config.json, pref/hashes, cikti) DAIMA .exe'nin yaninda durur.
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    HERE   = Path(sys.executable).parent.resolve()          # exe yani: config, pref
+    BUNDLE = Path(getattr(sys, "_MEIPASS", HERE)).resolve()  # gomulu: _vendor
+else:
+    HERE = BUNDLE = Path(__file__).parent.resolve()
 
+if not FROZEN:
+    _REQUIRED = ["requests", "pyzstd", "xxhash"]
+    _missing = [p for p in _REQUIRED if __import__("importlib").util.find_spec(p) is None]
+    if _missing:
+        print(f"[!] eksik paketler: {', '.join(_missing)}")
+        print("[*] yukleniyor...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *_missing])
+        print("[+] paketler kuruldu\n")
 
-LTMAO_SRC = HERE / "_vendor" / "LtMAO" / "src"
+LTMAO_SRC = BUNDLE / "_vendor" / "LtMAO" / "src"
 if not LTMAO_SRC.exists():
+    if FROZEN:
+        sys.exit("[!] LtMAO .exe icine paketlenmemis (build hatasi).")
     print("[!] LtMAO bulunamadi.")
     ans = input("    indirilsin mi? (e/h): ").strip().lower()
     if ans == "e":
@@ -43,7 +55,7 @@ if not LTMAO_SRC.exists():
         subprocess.check_call([
             "git", "clone", "--depth=1",
             "https://github.com/GuiSaiUwU/LtMAO",
-            str(HERE / "_vendor" / "LtMAO")
+            str(BUNDLE / "_vendor" / "LtMAO")
         ])
         print("[+] LtMAO indirildi\n")
     else:
@@ -58,6 +70,7 @@ os.chdir(WORK_DIR)
 from LtMAO import pyRitoFile, hash_helper  # type: ignore
 from LtMAO.hash_helper import CDTBHashes, CustomHashes, Storage  # type: ignore
 from LtMAO import no_skin  # type: ignore
+from LtMAO.pyRitoFile.helper import FNV1a  # type: ignore
 
 for _d in (CDTBHashes.local_dir, CustomHashes.local_dir, "./pref/hashes/extracted_hashes"):
     os.makedirs(_d, exist_ok=True)
@@ -315,7 +328,7 @@ def fetch_catalog(only_key: str) -> tuple[str, dict, dict, int]:
 
     chroma_meta: dict[str, dict[int, dict]] = {only_key: {}}
     try:
-        champ_skins = http_json(f"{CDRAGON_BASE}/v1/champions/{target_id}.json").get("skins", [])
+        champ_skins = _cdragon_json_cached(f"{CDRAGON_BASE}/v1/champions/{target_id}.json").get("skins", [])
     except Exception:
         champ_skins = []
 
@@ -392,21 +405,139 @@ def hyperlink(text: str, url: str | None) -> str:
 
 
 def load_hashes(refresh: bool = False):
-    cache = WORK_DIR / "pref" / "hashes" / "cdtb_hashes"
+    """Hash'ler bir kez indirilir; sonrasinda yerelden okunur. Network sync
+    (guncelleme kontrolu) yalnizca CARSAMBA gunleri (gunde bir kez) ya da
+    refresh / ilk calistirma durumunda yapilir. Patch'ler Carsamba ciktigi
+    icin yeterli."""
+    cache  = WORK_DIR / "pref" / "hashes" / "cdtb_hashes"
+    custom = WORK_DIR / "pref" / "hashes" / "custom_hashes"
+    marker = WORK_DIR / "pref" / "hashes" / ".last_sync"
     if refresh and cache.exists():
         for f in cache.iterdir():
-            f.unlink()
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    today      = datetime.now().date().isoformat()
+    have_local = (custom / "hashes.game.txt").exists()
+    last_sync  = ""
+    try:
+        last_sync = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    is_wednesday = datetime.now().weekday() == 2          # 0=Pzt, 2=Carsamba
+    need_sync = refresh or not have_local or (is_wednesday and last_sync != today)
+
     import io, contextlib
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        CDTBHashes.sync_all()
+    with contextlib.redirect_stdout(io.StringIO()):
+        if need_sync:
+            CDTBHashes.sync_all()
+            try:
+                marker.write_text(today, encoding="utf-8")
+            except OSError:
+                pass
         CustomHashes.read_all_hashes()
-    print(f"[+] hashler yuklendi ({len(Storage.hashtables['hashes.game.txt'])} entry)\n")
+    global _BIN_TABLES
+    _BIN_TABLES = None                  # tablo cache'ini tazele (yeni hash'lerle)
+    src = "sync+yerel" if need_sync else "yerel (sync atlandi)"
+    print(f"[+] hashler yuklendi ({src}, {len(Storage.hashtables['hashes.game.txt'])} entry)\n")
 
 
 # ----------------------------------------------------------------------------
 #  Skin builder
 # ----------------------------------------------------------------------------
+# Bin-swap edilen TUM .fantome'larda ayni imza
+FANTOME_AUTHOR = "kick.com/rahasya"
+FANTOME_DESC   = "kick.com/rahasya"
+
+
+def fantome_meta(name: str, version: str = "1.0.0") -> str:
+    return json.dumps({
+        "Name": name,
+        "Author": FANTOME_AUTHOR,
+        "Version": version,
+        "Description": FANTOME_DESC,
+    }, indent=2, ensure_ascii=False)
+
+
+_BIN_TABLES = None
+
+
+def _bin_tables() -> tuple[dict, dict]:
+    """hashes.game.txt'i bir kez tarar: (skin_bin_tablosu, animasyon_bin_tablosu).
+    Cache'li - tekrar tekrar 2M entry taranmasin (hiz)."""
+    global _BIN_TABLES
+    if _BIN_TABLES is None:
+        skins, anims = {}, {}
+        for h, p in hash_helper.Storage.hashtables["hashes.game.txt"].items():
+            pl = p.lower()
+            if not pl.endswith(".bin") or "data/characters/" not in pl:
+                continue
+            if "/skins/skin" in pl and "root.bin" not in pl:
+                skins[h] = p
+            elif "/animations/skin" in pl:
+                anims[h] = p
+        _BIN_TABLES = (skins, anims)
+    return _BIN_TABLES
+
+
+def skin_bin_hash_table() -> dict:
+    """data/characters/<champ>/skins/skinN.bin yollari."""
+    return _bin_tables()[0]
+
+
+def anim_bin_hash_table() -> dict:
+    """data/characters/<champ>/animations/skinN.bin yollari."""
+    return _bin_tables()[1]
+
+
+def _bin_hash_le(path: str) -> bytes:
+    """bin link hash'i (FNV) little-endian 4 byte - ham bin icinde aramak icin."""
+    return struct.pack("<I", int(str(no_skin.bin_hash(path)), 16))
+
+
+def _make_anim0(wad_path, char_anims: dict, char: str, num: int, skinN_raw: bytes):
+    """Skin'in kullandigi animations bin'ini (skin'e ozel VFX/event bindings)
+    skin0'a cevirir: AnimationGraphData entry hash'ini Skin{M} -> Skin0 yapar.
+    Custom animasyon yoksa None (base skin0 anim'i kullanilir).
+    char_anims: {M: chunk}  (oyun WAD'indaki animations/skinM.bin chunk'lari)."""
+    if not char_anims:
+        return None
+    # M: bu karakterin kendi skin{num} anim bin'i varsa M=num; yoksa skinN ham
+    #    veride hangi animations/skinM'i referans ediyorsa o (chroma -> parent).
+    M = None
+    if num in char_anims:
+        M = num
+    else:
+        for m in char_anims:
+            if m == 0:
+                continue
+            if _bin_hash_le(f"characters/{char}/animations/skin{m}") in skinN_raw:
+                M = m
+                break
+    if not M:                                   # custom animasyon yok
+        return None
+    chunk = char_anims[M]
+    with pyRitoFile.stream.BytesStream.reader(str(wad_path)) as bs:
+        chunk.read_data(bs)
+    try:
+        raw = bytes(chunk.data)
+    finally:
+        chunk.free_data()
+    # AnimationGraphData entry hash'ini Skin{M} -> Skin0: ham byte'larda 4-byte
+    # FNV swap (pyRitoFile parse-write animasyonda kayipli olabilir)
+    cap = char[:1].upper() + char[1:]
+    out = bytearray(raw)
+    for old, new in ((f"Characters/{cap}/Animations/Skin{M}", f"Characters/{cap}/Animations/Skin0"),
+                     (f"characters/{char}/animations/skin{M}", f"characters/{char}/animations/skin0")):
+        i = out.find(FNV1a(old).to_bytes(4, "little"))
+        if i >= 0:
+            out[i:i + 4] = FNV1a(new).to_bytes(4, "little")
+            return bytes(out)
+    return None
+
+
 class SkinBuilder:
     def __init__(self, champions_dir: Path, output_dir: Path,
                  catalog: dict, chroma_meta: dict, champ_id: int = 0):
@@ -416,15 +547,7 @@ class SkinBuilder:
         self.chroma_meta   = chroma_meta
         self.champ_id      = champ_id
         self._used_names: set[str] = set()
-
-        all_game = hash_helper.Storage.hashtables["hashes.game.txt"]
-        self.skin_bin_hashes = {
-            h: p for h, p in all_game.items()
-            if p.lower().endswith(".bin")
-            and "data/characters/" in p.lower()
-            and "/skins/" in p.lower()
-            and "root.bin" not in p.lower()
-        }
+        self.skin_bin_hashes = skin_bin_hash_table()
 
     def list_skins(self, champ_key: str) -> list[dict]:
         wad_path = self._find_wad(champ_key)
@@ -517,20 +640,27 @@ class SkinBuilder:
             return None
 
         wad = pyRitoFile.wad.WAD().read(str(wad_path))
-        wad.un_hash({"hashes.game.txt": self.skin_bin_hashes})
+        wad.un_hash({"hashes.game.txt": {**self.skin_bin_hashes, **anim_bin_hash_table()}})
 
         champ_lower = champ_key.lower()
         characters: dict[str, dict] = {}
+        char_anims: dict[str, dict] = {}        # char -> {M: chunk}  (animations/skinM.bin)
         for chunk in wad.chunks:
             if chunk.extension != "bin":
                 continue
             parts = chunk.hash.lower().split("/")
-            if (len(parts) < 5 or parts[0] != "data"
-                    or parts[1] != "characters"
-                    or parts[3] != "skins"):
+            if (len(parts) < 5 or parts[0] != "data" or parts[1] != "characters"):
                 continue
             char = parts[2]
             base = parts[4][:-4]
+            if parts[3] == "animations" and base.startswith("skin"):
+                try:
+                    char_anims.setdefault(char, {})[int(base.removeprefix("skin"))] = chunk
+                except ValueError:
+                    pass
+                continue
+            if parts[3] != "skins":
+                continue
             ent  = characters.setdefault(char, {"skin0": None, "skinN": {}})
             if base == "skin0":
                 ent["skin0"] = chunk
@@ -585,16 +715,29 @@ class SkinBuilder:
             chunk = info["skinN"][num]
             with pyRitoFile.stream.BytesStream.reader(str(wad_path)) as bs:
                 chunk.read_data(bs)
+            skinN_raw = bytes(chunk.data)
             try:
                 skin_bin = _read_bin(chunk.data)
             finally:
                 chunk.free_data()
             try:
-                data = _patch_bin(char, skin_bin, char_s0_bins.get(char), scdp_h, rr_h)
-            except RuntimeError as e:
+                # gear-tier skinler (Battle Queen vs.) -> ritobin (kayipsiz);
+                # geri kalan tum skinler -> mevcut hizli pyRitoFile yolu
+                if _is_gear_tier(skin_bin) and _ritobin_cli():
+                    data = _patch_skin_via_ritobin(char, skinN_raw, num)
+                else:
+                    data = _patch_bin(char, skin_bin, char_s0_bins.get(char), scdp_h, rr_h)
+            except Exception as e:
                 print(f"      · skip {char}: {e}")
                 continue
             patched.append((f"data/characters/{char}/skins/skin0.bin", data))
+            # skin'e ozel animasyon bin'i (VFX/event bindings) - eksikse VFX buglu
+            try:
+                anim = _make_anim0(wad_path, char_anims.get(char), char, num, skinN_raw)
+                if anim:
+                    patched.append((f"data/characters/{char}/animations/skin0.bin", anim))
+            except Exception as e:
+                print(f"      · {char} anim bin atlandi: {e}")
 
         if not patched:
             print(f"  [!] {champ_key} skin{num}: patch edilecek karakter yok")
@@ -615,12 +758,7 @@ class SkinBuilder:
         out_path = self._unique_path(fname)
 
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
-            zf.writestr("META/info.json", json.dumps({
-                "Name": display,
-                "Author": "kick.com/rahasya",
-                "Version": "1.0.0",
-                "Description": "Extracted by kick.com/rahasya via Sunshine.",
-            }, indent=2))
+            zf.writestr("META/info.json", fantome_meta(display))
 
             # CDragon splash'ini onizleme olarak gom (LTK/cslol META/image.png okur)
             img = http_bytes(skin_info.get("splash"))
@@ -708,6 +846,596 @@ def _patch_bin(char_lower, skin_bin, skin0_bin, skin0_scdp, skin0_rr):
 
 
 # ----------------------------------------------------------------------------
+#  Gear-tier skinler (Battle Queen Katarina, Pajama Guardian Lulu, ...)
+#  pyRitoFile BIN.write bunlardaki GearSkinUpgrade entry'lerini kirpiyor;
+#  bu yuzden ritobin_cli ile text round-trip + gear-resource inlining yapilir.
+# ----------------------------------------------------------------------------
+_GEAR_TYPE = f"{FNV1a('GearSkinUpgrade'):08x}"
+_RITOBIN_CLI = "__unset__"
+
+
+def _ritobin_cli() -> Path | None:
+    global _RITOBIN_CLI
+    if _RITOBIN_CLI == "__unset__":
+        for cand in (BUNDLE / "_vendor" / "LtMAO" / "res" / "tools" / "ritobin_cli.exe",
+                     BUNDLE / "_vendor" / "ritobin_cli.exe",
+                     HERE / "_vendor" / "LtMAO" / "res" / "tools" / "ritobin_cli.exe"):
+            if cand.exists():
+                _RITOBIN_CLI = cand
+                break
+        else:
+            _RITOBIN_CLI = None
+    return _RITOBIN_CLI
+
+
+def _is_gear_tier(skin_bin) -> bool:
+    return any(e.type == _GEAR_TYPE for e in skin_bin.entries or [])
+
+
+def _find_matching_brace(text: str, start: int) -> int:
+    depth = 0
+    in_str = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == '"' and (i == 0 or text[i - 1] != "\\"):
+            in_str = not in_str
+        elif not in_str:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return len(text)
+
+
+def _inline_gear_resources(text: str, char_cap: str, num: int) -> str:
+    """Level-1 gear'in mVFXResourceResolver.resourceMap'ini ana ResourceResolver'a
+    inline eder ve initialSubmeshToHide'dan gear submesh token'larini cikarir
+    (spawn'da seviye-1 silahlar gorunsun)."""
+    gm = re.search(r'mGearSkinUpgrades:\s*list\[link\]\s*=\s*\{([^}]*)\}', text, re.DOTALL)
+    if not gm:
+        return text
+    m = re.search(r'"([^"]+)"', gm.group(1))
+    if not m:
+        return text
+    marker = f'"{m.group(1)}" = GearSkinUpgrade'
+    idx = text.find(marker)
+    if idx < 0:
+        return text
+    bo = text.find('{', idx)
+    gear_block = text[bo:_find_matching_brace(text, bo)]
+
+    rr_idx = gear_block.find('mVFXResourceResolver: pointer = ResourceResolver')
+    if rr_idx < 0:
+        return text
+    rr_bo = gear_block.find('{', rr_idx)
+    rr_block = gear_block[rr_bo:_find_matching_brace(gear_block, rr_bo)]
+
+    rm_idx = rr_block.find('resourceMap: map[hash,link]')
+    if rm_idx < 0:
+        return text
+    rm_bo = rr_block.find('{', rm_idx)
+    rm_close = _find_matching_brace(rr_block, rm_bo)
+    gear_resources = rr_block[rm_bo + 1:rm_close - 1]
+
+    show_tokens: set = set()
+    sm = re.search(r'mCharacterSubmeshesToShow:\s*list\[hash\]\s*=\s*\{([^}]*)\}', gear_block, re.DOTALL)
+    if sm:
+        show_tokens = set(re.findall(r'"([^"]+)"', sm.group(1)))
+
+    for rr_name in (f'"Characters/{char_cap}/Skins/Skin0/Resources" = ResourceResolver',
+                    f'"Characters/{char_cap}/Skins/Skin{num}/Resources" = ResourceResolver'):
+        rr_pos = text.find(rr_name)
+        if rr_pos < 0:
+            continue
+        rm_marker = 'resourceMap: map[hash,link] = {'
+        rm_pos = text.find(rm_marker, rr_pos)
+        if rm_pos < 0:
+            continue
+        insert_at = rm_pos + len(rm_marker)
+        text = text[:insert_at] + '\n' + gear_resources.rstrip('\n') + '\n' + text[insert_at:]
+        break
+
+    if show_tokens:
+        def _strip(mt):
+            kept = [t for t in mt.group(2).split() if t not in show_tokens]
+            return mt.group(1) + ' '.join(kept) + mt.group(3)
+        text = re.sub(r'(initialSubmeshToHide: string = ")([^"]*)(")', _strip, text)
+    return text
+
+
+def _patch_skin_via_ritobin(char_lower: str, skin_raw: bytes, num: int) -> bytes:
+    """Gear-tier skin: ritobin_cli ile bin->text->bin (byte-kayipsiz) + entry
+    rename (Skin{num}->Skin0) + gear-resource inlining."""
+    cli = _ritobin_cli()
+    if cli is None:
+        raise RuntimeError("ritobin_cli.exe yok (gear-tier skin)")
+    hashdir = WORK_DIR / "pref" / "hashes" / "cdtb_hashes"
+    cap = char_lower[:1].upper() + char_lower[1:]
+    with tempfile.TemporaryDirectory() as td:
+        in_bin, in_txt, out_bin = Path(td) / "i.bin", Path(td) / "i.txt", Path(td) / "o.bin"
+        in_bin.write_bytes(skin_raw)
+        r = subprocess.run([str(cli), "-d", str(hashdir), str(in_bin), str(in_txt)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ritobin bin->txt: {r.stderr or r.stdout}")
+        text = in_txt.read_text(encoding="utf-8")
+        text = re.sub(rf'("Characters/{re.escape(cap)}/Skins/Skin){num}(" = SkinCharacterDataProperties)',
+                      r'\g<1>0\g<2>', text)
+        text = re.sub(rf'("Characters/{re.escape(cap)}/Skins/Skin){num}(/Resources" = ResourceResolver)',
+                      r'\g<1>0\g<2>', text)
+        text = re.sub(rf'(mResourceResolver: link = "Characters/{re.escape(cap)}/Skins/Skin){num}(/Resources")',
+                      r'\g<1>0\g<2>', text)
+        text = re.sub(rf'(championSkinName: string = ")\w+Skin{num}(")', rf'\g<1>{cap}\g<2>', text)
+        text = _inline_gear_resources(text, cap, num)
+        in_txt.write_text(text, encoding="utf-8")
+        r = subprocess.run([str(cli), "-d", str(hashdir), str(in_txt), str(out_bin)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ritobin txt->bin: {r.stderr or r.stdout}")
+        return out_bin.read_bytes()
+
+
+# ----------------------------------------------------------------------------
+#  Harici mod aktarimi: .fantome / .wad  ->  skin0 bin-swap  ->  .fantome
+# ----------------------------------------------------------------------------
+# WAD/<wadname>/data/characters/<champ>/skins/skinN.bin  (fantome ic yolu)
+_SKIN_BIN_RE = re.compile(
+    r"^(?P<pre>wad/[^/]+/)?data/characters/(?P<champ>[^/]+)/skins/skin(?P<num>\d+)\.bin$",
+    re.IGNORECASE)
+
+
+def _load_skin0_ref(game_wad: Path, char_lower: str, table: dict):
+    """Oyun WAD'indan ilgili karakterin skin0 referansini cikarir:
+    (skin0_bin, scdp_hash, rr_hash). Bulunamazsa (None, None, None)."""
+    wad = pyRitoFile.wad.WAD().read(str(game_wad))
+    wad.un_hash({"hashes.game.txt": table})
+    target = f"data/characters/{char_lower}/skins/skin0.bin"
+    chunk = next((c for c in wad.chunks
+                  if c.extension == "bin" and c.hash.lower() == target), None)
+    if not chunk:
+        return None, None, None
+    with pyRitoFile.stream.BytesStream.reader(str(game_wad)) as bs:
+        chunk.read_data(bs)
+    try:
+        s0 = _read_bin(chunk.data)
+    finally:
+        chunk.free_data()
+    scdp_h = rr_h = None
+    for entry in s0.entries or []:
+        if entry.type == hash_helper.Storage.bin_hashes["SkinCharacterDataProperties"]:
+            scdp_h = entry.hash
+            for f in entry.data:
+                if f.hash == hash_helper.Storage.bin_hashes["mResourceResolver"]:
+                    rr_h = f.data
+                    break
+        elif entry.type == hash_helper.Storage.bin_hashes["ResourceResolver"]:
+            if rr_h is None:
+                rr_h = entry.hash
+    return (s0, scdp_h, rr_h) if scdp_h else (None, None, None)
+
+
+def _load_game_skin_bin(game_wad: Path, char_lower: str, num: int, table: dict):
+    """Oyun WAD'indan skinN.bin'i okuyup parse eder (texture-only mod fallback'i
+    icin: o skin'in bin'ini cekip skin0'a swap'lariz). Bulunamazsa None."""
+    wad = pyRitoFile.wad.WAD().read(str(game_wad))
+    wad.un_hash({"hashes.game.txt": table})
+    target = f"data/characters/{char_lower}/skins/skin{num}.bin"
+    chunk = next((c for c in wad.chunks
+                  if c.extension == "bin" and c.hash.lower() == target), None)
+    if not chunk:
+        return None
+    with pyRitoFile.stream.BytesStream.reader(str(game_wad)) as bs:
+        chunk.read_data(bs)
+    try:
+        return _read_bin(chunk.data)
+    finally:
+        chunk.free_data()
+
+
+# assets/characters/<char>/skins/skin01/...  (texture yollarindan skin tespiti)
+_ASSET_SKIN_RE = re.compile(r"assets/characters/([^/]+)/skins/skin0*(\d+)/", re.IGNORECASE)
+
+
+def _game_chars_with_skin(game_wad: Path, num: int, table: dict) -> list[str]:
+    """Oyun WAD'inda hem skin{num}.bin hem skin0.bin'i olan TUM karakterler.
+    Bir sampiyonun golge/klon alt-karakterleri (or. zedshadow) de buraya girer;
+    boylece skin sadece ana govdede degil golgelerde de uygulanir."""
+    wad = pyRitoFile.wad.WAD().read(str(game_wad))
+    wad.un_hash({"hashes.game.txt": table})
+    chars: dict[str, set[int]] = {}
+    for c in wad.chunks:
+        if c.extension != "bin":
+            continue
+        mm = _SKIN_BIN_RE.match(str(c.hash))
+        if mm:
+            chars.setdefault(mm.group("champ").lower(), set()).add(int(mm.group("num")))
+    return [ch for ch, nums in chars.items() if num in nums and 0 in nums]
+
+
+def _find_game_wad_by_name(champions_dir: Path, wad_name: str) -> Path | None:
+    """Mod WAD'inin dosya adiyla ESLESEN oyun WAD'i (or. Zed.wad.client).
+    Bir WAD birden fazla karakter icerir (zed + zedshadow), hepsinin skin0'i
+    bu tek dosyadadir."""
+    target = wad_name.lower()
+    for w in champions_dir.glob("*.wad.client"):
+        if w.name.lower() == target:
+            return w
+    return None
+
+
+def _find_game_wad_by_char(champions_dir: Path, char_lower: str) -> Path | None:
+    for w in champions_dir.glob("*.wad.client"):
+        if w.name.split(".", 1)[0].lower() == char_lower:
+            return w
+    return None
+
+
+def _tmp_write(data: bytes, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+        tf.write(data)
+        return tf.name
+
+
+def _write_wad(chunks: list[tuple[str, bytes]]) -> bytes:
+    """[(hash_veya_path, data)] -> WAD bytes (no_skin yazma deseni)."""
+    path = _tmp_write(b"", ".wad.client")
+    try:
+        wad = pyRitoFile.wad.WAD()
+        wad.chunks = [pyRitoFile.wad.WADChunk.default() for _ in chunks]
+        wad.write(path)
+        with pyRitoFile.stream.BytesStream.updater(path) as bs:
+            for i, ch in enumerate(wad.chunks):
+                ch.write_data(bs, i, chunks[i][0], chunks[i][1])
+                ch.free_data()
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _ref_cached(cache: dict, game_wad: Path | None, char: str, table: dict):
+    key = (str(game_wad).lower() if game_wad else "", char)
+    if key not in cache:
+        if not game_wad:
+            cache[key] = (None, None, None)
+        else:
+            try:
+                cache[key] = _load_skin0_ref(game_wad, char, table)
+            except Exception as e:
+                print(f"  [!] {char}: skin0 referansi alinamadi ({e})")
+                cache[key] = (None, None, None)
+    return cache[key]
+
+
+def _is_raw_wad_entry(arcname: str, data: bytes) -> str | None:
+    """fantome icindeki HAM WAD blob'u mu? (WAD/<ad>.wad.client tek dosya).
+    Evetse wad adini, degilse None doner."""
+    parts = arcname.replace("\\", "/").split("/")
+    if (len(parts) == 2 and parts[0].lower() == "wad"
+            and (parts[1].lower().endswith(".wad.client")
+                 or parts[1].lower().endswith(".wad"))
+            and data[:2] == b"RW"):
+        return parts[1]
+    return None
+
+
+def _rewrite_wad_skin0(wad_bytes: bytes, wad_name: str, champions_dir: Path,
+                       table: dict, ref_cache: dict, stats: dict) -> tuple[bytes | None, str]:
+    """Ham WAD icindeki skinN bin chunk'larini skin0'a cevirir, diger TUM
+    chunk'lari (custom texture/mesh/anim dahil) korur. (yeni_bytes|None, champ)."""
+    tmp_in = _tmp_write(wad_bytes, ".wad.client")
+    try:
+        wad = pyRitoFile.wad.WAD().read(tmp_in)
+        # tam tablo: hem skin bin'leri hem asset (texture) yollari cozulsun
+        full = hash_helper.Storage.hashtables["hashes.game.txt"]
+        wad.un_hash({"hashes.game.txt": full})
+        game_wad = _find_game_wad_by_name(champions_dir, wad_name)
+
+        out_chunks: list[tuple[str, bytes]] = []
+        seen_skin0: set[str] = set()
+        asset_skins: dict[str, dict[int, int]] = {}   # char -> {skin_num: sayac}
+        primary = ""
+        with pyRitoFile.stream.BytesStream.reader(tmp_in) as bs:
+            for c in wad.chunks:
+                c.read_data(bs)
+                data = c.data
+                h = str(c.hash)
+                # texture-only fallback icin asset yollarindan skin say
+                am = _ASSET_SKIN_RE.search(h)
+                if am:
+                    ch, n = am.group(1).lower(), int(am.group(2))
+                    if n > 0:
+                        asset_skins.setdefault(ch, {}).setdefault(n, 0)
+                        asset_skins[ch][n] += 1
+                m = _SKIN_BIN_RE.match(h) if c.extension == "bin" else None
+                if not m:
+                    out_chunks.append((h, data))
+                    c.free_data()
+                    continue
+                champ = m.group("champ").lower()
+                num   = int(m.group("num"))
+                c.free_data()
+                if num == 0:
+                    out_chunks.append((h, data))
+                    stats["base"] += 1
+                    continue
+                gw = game_wad or _find_game_wad_by_char(champions_dir, champ)
+                s0_bin, scdp_h, rr_h = _ref_cached(ref_cache, gw, champ, table)
+                if not scdp_h:
+                    if not gw:
+                        print(f"  [!] {champ}: oyun WAD'i yok, skin{num} cevrilemedi")
+                    out_chunks.append((h, data))
+                    continue
+                target = f"data/characters/{champ}/skins/skin0.bin"
+                if target in seen_skin0:
+                    print(f"  [!] {champ}: birden fazla skin skin0'a denk geldi, "
+                          f"skin{num} atlandi")
+                    out_chunks.append((h, data))
+                    continue
+                try:
+                    skin_bin = pyRitoFile.bin.BIN().read(data, raw=True)
+                    patched  = _patch_bin(champ, skin_bin, s0_bin, scdp_h, rr_h)
+                except Exception as e:
+                    print(f"  [!] {champ} skin{num}: patch hatasi ({e}), atlandi")
+                    out_chunks.append((h, data))
+                    continue
+                seen_skin0.add(target)
+                out_chunks.append((target, patched))
+                print(f"  [+] {champ} skin{num} -> skin0   (WAD: {wad_name})")
+                stats["swapped"] += 1
+                stats.setdefault("_wanted", set()).add(num)
+                cp = gw.name.split(".", 1)[0] if gw else champ.capitalize()
+                stats.setdefault("source", (cp, num))
+                if not primary:
+                    primary = cp
+
+        # texture-only mod (bin yok): asset yollarindan baskin skin'i tespit et
+        wanted = stats.get("_wanted", set())
+        gw_fill = game_wad
+        if not wanted and asset_skins:
+            agg: dict[int, int] = {}
+            for counts in asset_skins.values():
+                for n, cnt in counts.items():
+                    agg[n] = agg.get(n, 0) + cnt
+            if agg:
+                wanted = {max(agg, key=agg.get)}
+            if not gw_fill:
+                gw_fill = _find_game_wad_by_char(champions_dir, next(iter(asset_skins)))
+
+        # --- ana govde + alt-karakterleri (zedshadow gibi) skin0 yap ---
+        # ayni skin'e sahip TUM oyun karakterlerini oyundan cekip swap'la; boylece
+        # golgeler/klonlar da skin'e uyar (mod texture'lari yoksa oyunun skin'i gelir)
+        if wanted and gw_fill:
+            for num in sorted(wanted):
+                for ch in _game_chars_with_skin(gw_fill, num, table):
+                    target = f"data/characters/{ch}/skins/skin0.bin"
+                    if target in seen_skin0:
+                        continue
+                    s0_bin, scdp_h, rr_h = _ref_cached(ref_cache, gw_fill, ch, table)
+                    if not scdp_h:
+                        continue
+                    try:
+                        game_skin = _load_game_skin_bin(gw_fill, ch, num, table)
+                        if not game_skin:
+                            continue
+                        patched = _patch_bin(ch, game_skin, s0_bin, scdp_h, rr_h)
+                    except Exception as e:
+                        print(f"  [!] {ch} skin{num}: {e}")
+                        continue
+                    seen_skin0.add(target)
+                    out_chunks.append((target, patched))
+                    print(f"  [+] {ch} skin{num} -> skin0  (oyundan, alt-karakter/texture)")
+                    stats["swapped"] += 1
+                    cp = gw_fill.name.split(".", 1)[0]
+                    stats.setdefault("source", (cp, num))
+                    if not primary:
+                        primary = cp
+
+        if not seen_skin0:
+            return None, ""
+        return _write_wad(out_chunks), primary
+    finally:
+        try:
+            os.unlink(tmp_in)
+        except OSError:
+            pass
+
+
+def _fetch_skin_splash(champ_key: str, num: int) -> bytes | None:
+    """Kaynak skin'in CDragon splash gorselini (onizleme icin) indirir."""
+    try:
+        summary = _cdragon_json_cached(CDRAGON_SUMMARY)
+        cid = next((int(c["id"]) for c in summary
+                    if normalize(c.get("alias", "")) == normalize(champ_key)), 0)
+        if not cid:
+            return None
+        det = _cdragon_json_cached(f"{CDRAGON_BASE}/v1/champions/{cid}.json")
+        sid = cid * 1000 + num
+        skin = next((s for s in det.get("skins", []) if int(s.get("id", 0)) == sid), None)
+        if not skin:
+            return None
+        path = skin.get("splashPath") or skin.get("uncenteredSplashPath")
+        return http_bytes(cdragon_asset_url(path))
+    except Exception:
+        return None
+
+
+def convert_external_mod(src: Path, out_dir: Path,
+                         champions_dir: Path) -> tuple[Path, str] | None:
+    """Harici bir mod dosyasini (.fantome veya .wad) bin-swap ile skin0'a cevirir.
+    Iki fantome stili de desteklenir:
+      - klasor stili:  WAD/<ad>/data/characters/.../skinN.bin  (ayri dosyalar)
+      - ham WAD stili: WAD/<ad>.wad.client  (tek blob; yerinde yeniden yazilir)
+    (cikti_yolu, sampiyon_adi) doner; cevirecek bir sey yoksa None."""
+    if not src.exists():
+        print(f"  [!] dosya yok: {src}")
+        return None
+
+    table = skin_bin_hash_table()
+    ref_cache: dict = {}
+    stats = {"swapped": 0, "base": 0}
+    out_files: list[tuple[str, bytes]] = []
+    seen_targets: set[str] = set()
+    primary_champ = ""
+    name = src.name.lower()
+
+    try:
+        if name.endswith(".wad.client") or name.endswith(".wad"):
+            new_wad, champ = _rewrite_wad_skin0(
+                src.read_bytes(), src.name, champions_dir, table, ref_cache, stats)
+            if new_wad is None:
+                _report_no_swap(stats)
+                return None
+            primary_champ = champ
+            out_files.append((f"WAD/{src.name}", new_wad))
+
+        elif name.endswith(".fantome") or name.endswith(".zip"):
+            with zipfile.ZipFile(src) as zf:
+                entries = [(i.filename, zf.read(i.filename))
+                           for i in zf.infolist() if not i.is_dir()]
+            for arcname, data in entries:
+                if arcname.replace("\\", "/").lower() == "meta/info.json":
+                    try:
+                        orig = json.loads(data)
+                        nm, ver = str(orig.get("Name") or src.stem), str(orig.get("Version") or "1.0.0")
+                    except Exception:
+                        nm, ver = src.stem, "1.0.0"
+                    out_files.append((arcname, fantome_meta(nm, ver).encode("utf-8")))
+                    continue
+                wadn = _is_raw_wad_entry(arcname, data)
+                if wadn:                                   # ham WAD blob
+                    new_wad, champ = _rewrite_wad_skin0(
+                        data, wadn, champions_dir, table, ref_cache, stats)
+                    out_files.append((arcname, new_wad if new_wad is not None else data))
+                    if champ and not primary_champ:
+                        primary_champ = champ
+                    continue
+                m = _SKIN_BIN_RE.match(arcname.replace("\\", "/"))
+                if m:                                       # klasor stili skin bin
+                    champ = _swap_dir_skin_file(
+                        arcname, data, m, champions_dir, table, ref_cache,
+                        stats, seen_targets, out_files)
+                    if champ and not primary_champ:
+                        primary_champ = champ
+                    continue
+                out_files.append((arcname, data))          # diger her sey korunur
+        else:
+            print("  [!] desteklenmeyen dosya turu (.fantome veya .wad olmali)")
+            return None
+    except Exception as e:
+        print(f"  [!] islenemedi: {e}")
+        return None
+
+    if stats["swapped"] == 0:
+        _report_no_swap(stats)
+        return None
+
+    if not any(a.replace("\\", "/").lower() == "meta/info.json" for a, _ in out_files):
+        out_files.insert(0, ("META/info.json", fantome_meta(src.stem).encode("utf-8")))
+
+    # onizleme: modun kendi resmi varsa korunur; yoksa kaynak skin'in splash'i
+    if not any(a.replace("\\", "/").lower() == "meta/image.png" for a, _ in out_files):
+        source = stats.get("source")
+        if source:
+            img = _fetch_skin_splash(*source)
+            if img:
+                out_files.insert(0, ("META/image.png", img))
+                print(f"  [+] onizleme eklendi: {source[0]} skin{source[1]} splash")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r'[\\/*?:"<>|]', "", src.stem).strip() or "imported"
+    out_path = out_dir / f"{safe}.fantome"
+    n = 2
+    while out_path.exists():
+        out_path = out_dir / f"{safe} ({n}).fantome"
+        n += 1
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
+        for arcname, data in out_files:
+            zf.writestr(arcname, data)
+
+    print(f"\n  ✓ {stats['swapped']} skin -> skin0,  {len(out_files)} dosya paketlendi")
+    print(f"  -> {out_path}")
+    return out_path, primary_champ
+
+
+def _swap_dir_skin_file(arcname, data, m, champions_dir, table, ref_cache,
+                        stats, seen_targets, out_files) -> str:
+    """Klasor-stili .fantome icindeki tek bir skinN.bin dosyasini skin0'a cevirir.
+    out_files'a ekler; primary champ adi veya '' doner."""
+    champ = m.group("champ").lower()
+    num   = int(m.group("num"))
+    norm  = arcname.replace("\\", "/")
+    if num == 0:
+        out_files.append((arcname, data))
+        stats["base"] += 1
+        return ""
+    wadn = m.group("pre")[4:-1] if m.group("pre") else ""   # 'wad/<ad>/' -> '<ad>'
+    gw = (_find_game_wad_by_name(champions_dir, wadn) if wadn
+          else _find_game_wad_by_char(champions_dir, champ))
+    s0_bin, scdp_h, rr_h = _ref_cached(ref_cache, gw, champ, table)
+    if not scdp_h:
+        if not gw:
+            print(f"  [!] {champ}: oyun WAD'i yok, skin{num} cevrilemedi")
+        out_files.append((arcname, data))
+        return ""
+    target = norm[:m.start("num") - 4] + "skin0.bin"
+    if target.lower() in seen_targets:
+        print(f"  [!] {champ}: birden fazla skin skin0'a denk geldi, skin{num} atlandi")
+        out_files.append((arcname, data))
+        return ""
+    try:
+        skin_bin = _read_bin(data)
+        patched  = _patch_bin(champ, skin_bin, s0_bin, scdp_h, rr_h)
+    except Exception as e:
+        print(f"  [!] {champ} skin{num}: patch hatasi ({e}), atlandi")
+        out_files.append((arcname, data))
+        return ""
+    seen_targets.add(target.lower())
+    out_files.append((target, patched))
+    print(f"  [+] {champ} skin{num} -> skin0")
+    stats["swapped"] += 1
+    champ_proper = gw.name.split(".", 1)[0] if gw else champ.capitalize()
+    stats.setdefault("source", (champ_proper, num))
+    return champ_proper
+
+
+def _report_no_swap(stats: dict) -> None:
+    if stats["base"]:
+        print("  [i] Dosya zaten temel skini (skin0) hedefliyor; cevrilecek skinN yok.")
+    else:
+        print("  [!] Cevrilecek skin bin'i bulunamadi.")
+
+
+def import_mod_mode(champions_dir: Path, out_dir: Path) -> None:
+    print("\n  " + "═" * 64)
+    print("   FANTOME / WAD AKTAR  ->  skin0'a cevir")
+    print("  " + "═" * 64)
+    print("  Harici bir .fantome veya .wad dosyasinin yolunu yapistir.")
+    print("  Bin-swap ile skinN -> skin0 yapilir, sonuc /Extracted'e .fantome olur.")
+    print("  (Surukle-birak da calisir; tirnak otomatik temizlenir.)")
+    while True:
+        raw = input("\n  Dosya yolu ('geri' = menu): ").strip()
+        if raw.lower() in ("geri", "back", "b", ""):
+            return
+        path = Path(raw.strip().strip('"').strip("'"))
+        if not path.exists():
+            print(f"  [!] bulunamadi: {path}")
+            continue
+        result = convert_external_mod(path, out_dir, champions_dir)
+        if result and CONFIG.get("ltk_auto"):
+            out_path, champ = result
+            maybe_ltk_import([(out_path, champ)])
+
+
+# ----------------------------------------------------------------------------
 #  Arama / secim yardimcilari
 # ----------------------------------------------------------------------------
 def normalize(s: str) -> str:
@@ -715,10 +1443,13 @@ def normalize(s: str) -> str:
 
 
 def list_champ_keys(champions_dir: Path) -> list[str]:
+    # "_" iceren WAD'lar gercek sampiyon degil (Ruby_*/Strawberry_* = oyun-modu
+    # yardimci karakterleri); bunlari ele.
     return sorted(
-        w.stem.split(".", 1)[0]
+        w.name.split(".", 1)[0]
         for w in champions_dir.glob("*.wad.client")
         if w.name.count(".") == 2 and w.name.split(".", 1)[1] == "wad.client"
+        and "_" not in w.name.split(".", 1)[0]
     )
 
 
@@ -877,6 +1608,29 @@ def _ltk_running() -> bool:
         return False
 
 
+def _ltk_watcher_enabled() -> bool:
+    """LTK'nin 'Library watcher'i acik mi? (settings.json -> watcherEnabled)
+    Acikken LTK, library.json degisimini gorup modlari canli hot-reload eder;
+    o zaman LTK'yi kapatmadan ekleyebiliriz."""
+    base = ltk_dir()
+    if not base:
+        return False
+    try:
+        s = json.loads((base / "settings.json").read_text(encoding="utf-8"))
+        return bool(s.get("watcherEnabled"))
+    except Exception:
+        return False
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """JSON'u once .tmp'ye yazip os.replace ile yerine koyar. Boylece LTK'nin
+    izleyicisi (notify-debouncer) tek temiz event gorur ve LTK asla yari
+    yazilmis library.json okumaz (atomik degis-tokus)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def ltk_import(items: list[tuple[Path, str]]) -> tuple[int, int]:
     """(fantome_yolu, klasor_adi) listesini LTK kutuphanesine ekler:
     archives/<id>.fantome + mods/<id>/mod.config.json + library.json kaydi.
@@ -885,46 +1639,35 @@ def ltk_import(items: list[tuple[Path, str]]) -> tuple[int, int]:
     if not base:
         return 0, len(items)
     lib_path = base / "library.json"
-    try:
-        lib = json.loads(lib_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"  [LTK] library.json okunamadi: {e}")
-        return 0, len(items)
-
-    mods    = lib.setdefault("mods", [])
-    folders = lib.setdefault("folders", [])
-    order   = lib.setdefault("folderOrder", [])
-    root = next((f for f in folders if f.get("id") == "root"), None)
-    if root is None:
-        root = {"id": "root", "name": "", "modIds": []}
-        folders.insert(0, root)
-    if "root" not in order:
-        order.insert(0, "root")
+    (base / "archives").mkdir(exist_ok=True)
+    (base / "mods").mkdir(exist_ok=True)
 
     slugify = lambda s: re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
-    # mevcut modlarin sluglari (ayni skini ikinci kez eklememek icin)
+    def read_lib() -> dict | None:
+        try:
+            return json.loads(lib_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  [LTK] library.json okunamadi: {e}")
+            return None
+
+    # --- 1) Mevcut sluglari oku (ayni skini ikinci kez eklememek icin) ----
+    lib0 = read_lib()
+    if lib0 is None:
+        return 0, len(items)
     existing: set[str] = set()
-    for m in mods:
+    for m in lib0.get("mods", []):
         cfg = base / "mods" / str(m.get("id", "")) / "mod.config.json"
         try:
             existing.add(json.loads(cfg.read_text(encoding="utf-8")).get("name", ""))
         except Exception:
             pass
 
-    def folder_for(name: str) -> dict:
-        for f in folders:
-            if str(f.get("name", "")).lower() == name.lower():
-                return f
-        f = {"id": str(uuid.uuid4()), "name": name, "modIds": []}
-        folders.append(f)
-        order.append(f["id"])
-        return f
-
-    (base / "archives").mkdir(exist_ok=True)
-    (base / "mods").mkdir(exist_ok=True)
-
-    added = skipped = 0
+    # --- 2) Dosyalari diske yaz, eklenecek kayitlari topla -----------------
+    #     (library.json'a HENUZ dokunmuyoruz; LTK acikken yazma penceresini
+    #      mumkun oldugunca kisa tutmak icin merge+yazma en sona birakildi.)
+    pending: list[tuple[str, str]] = []   # (mod_id, folder_name)
+    skipped = 0
     for fantome, folder_name in items:
         try:
             with zipfile.ZipFile(fantome) as zf:
@@ -952,21 +1695,51 @@ def ltk_import(items: list[tuple[Path, str]]) -> tuple[int, int]:
             "layers": [{"name": "base", "priority": 0,
                         "description": "Base layer of the mod"}],
         }, indent=2, ensure_ascii=False), encoding="utf-8")
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        existing.add(slug)
+        pending.append((mid, folder_name))
+
+    if not pending:
+        return 0, skipped
+
+    # --- 3) library.json'u TAZE oku (LTK acikken arada yazmis olabilir) ----
+    #     ve yeni kayitlari onun ustune ekle; boylece LTK'nin o sirada
+    #     yaptigi degisiklikleri ezmeyiz.
+    lib = read_lib() or lib0
+    mods    = lib.setdefault("mods", [])
+    folders = lib.setdefault("folders", [])
+    order   = lib.setdefault("folderOrder", [])
+    root = next((f for f in folders if f.get("id") == "root"), None)
+    if root is None:
+        root = {"id": "root", "name": "", "modIds": []}
+        folders.insert(0, root)
+    if "root" not in order:
+        order.insert(0, "root")
+
+    def folder_for(name: str) -> dict:
+        for f in folders:
+            if str(f.get("name", "")).lower() == name.lower():
+                return f
+        f = {"id": str(uuid.uuid4()), "name": name, "modIds": []}
+        folders.append(f)
+        order.append(f["id"])
+        return f
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    have = {str(m.get("id")) for m in mods}
+    for mid, folder_name in pending:
+        if mid in have:        # teorik cakisma; atla
+            continue
         mods.append({"id": mid, "installedAt": now, "format": "fantome"})
         target = folder_for(folder_name) if folder_name else root
         target.setdefault("modIds", []).append(mid)
-        existing.add(slug)
-        added += 1
 
-    if added:
-        try:
-            shutil.copy2(lib_path, lib_path.with_suffix(".json.bak"))
-        except Exception:
-            pass
-        lib_path.write_text(json.dumps(lib, indent=2, ensure_ascii=False),
-                            encoding="utf-8")
-    return added, skipped
+    # --- 4) Atomik yaz: izleyici tek temiz event gorur, LTK yari okumaz ----
+    try:
+        shutil.copy2(lib_path, lib_path.with_suffix(".json.bak"))
+    except Exception:
+        pass
+    _atomic_write_json(lib_path, lib)
+    return len(pending), skipped
 
 
 _LTK_SESSION_OK: bool | None = None  # None=henuz sorulmadi, False=bu oturum atla
@@ -980,23 +1753,44 @@ def maybe_ltk_import(built: list[tuple[Path, str]]) -> None:
     if not ltk_dir():
         print("  [LTK] kutuphane bulunamadi; Ayarlar'dan LTK klasorunu girin.")
         return
-    if _LTK_SESSION_OK is False:
-        return
-    if _LTK_SESSION_OK is None and _ltk_running():
-        print("  [LTK] LTK Manager acik gorunuyor. Acikken eklenirse LTK kendi")
-        print("        listesini ustune yazabilir; en guvenlisi once kapatmak.")
-        ans = input("        Yine de devam edilsin mi? (e/h): ").strip().lower()
-        _LTK_SESSION_OK = ans == "e"
-        if not _LTK_SESSION_OK:
-            print("  [LTK] bu oturumda import atlanacak (dosyalar diskte duruyor).")
+
+    running = _ltk_running()
+    watcher = _ltk_watcher_enabled() if running else False
+
+    # LTK acik AMA watcher kapali: eklediklerimizi gormez / ustune yazabilir.
+    # En guvenlisi kapatmak; ya da LTK ayarlarindan 'Library watcher'i acmak.
+    if running and not watcher:
+        if _LTK_SESSION_OK is False:
             return
+        if _LTK_SESSION_OK is None:
+            print("  [LTK] LTK Manager acik ve 'Library watcher' KAPALI.")
+            print("        Acikken eklenirse LTK degisikligi gormez ve kendi")
+            print("        listesini ustune yazabilir. Iki temiz secenek:")
+            print("          - LTK'yi kapat, sonra ekle  (klasik), VEYA")
+            print("          - LTK ayarlarindan 'Library watcher'i ac  -> o zaman")
+            print("            KAPATMADAN canli eklenir (onerilen).")
+            try:
+                ans = input("        Yine de simdi eklensin mi? (e/h): ").strip().lower()
+            except EOFError:
+                ans = "h"   # non-interaktif (GUI / CLI --import-mod): guvenli taraf
+            _LTK_SESSION_OK = ans == "e"
+            if not _LTK_SESSION_OK:
+                print("  [LTK] bu oturumda import atlanacak (dosyalar diskte duruyor).")
+                return
+
     added, skipped = ltk_import(built)
     folder_names = ", ".join(dict.fromkeys(f for _, f in built if f))
     print(f"  [LTK] {added} mod eklendi"
           + (f", {skipped} atlandi (zaten ekli)" if skipped else "")
           + (f"  ->  klasor: {folder_names}" if folder_names else ""))
     if added:
-        print("  [LTK] LTK'yi (yeniden) acinca listede gorunur.")
+        if running and watcher:
+            print("  [LTK] 'Library watcher' acik -> LTK'da CANLI belirdi "
+                  "(kapatmaya gerek yok).")
+        elif running:
+            print("  [LTK] LTK'yi yeniden baslatinca listede gorunur.")
+        else:
+            print("  [LTK] LTK'yi acinca listede gorunur.")
 
 
 # ----------------------------------------------------------------------------
@@ -1604,6 +2398,11 @@ def show_how_to_use() -> None:
     print(f"      {D}Yarida kalirsa tekrar baslat, kaldigi yerden devam eder.{R}")
     print(line)
 
+    print(f"  {Y}[4] Fantome/WAD Aktar{R}  — disaridan mod -> skin0'a cevir")
+    print(f"      {D}Indirdigin bir .fantome/.wad'in skinN bin'ini bin-swap ile{R}")
+    print(f"      {D}skin0 yapar (temel skini hedefler), /Extracted'e .fantome dokar.{R}")
+    print(line)
+
     print(f"  {Y}[4] Ayarlar{R}  — League / cikti yolu      {Y}[5] Hash Yenile{R}")
     auto = f"{G}ACIK{R}" if CONFIG.get("ltk_auto") else f"{D}KAPALI{R}"
     print(f"      LTK auto-import: {auto} {D}— acikken build edilen her mod,{R}")
@@ -1619,9 +2418,10 @@ def show_menu() -> str:
     print("║  [1] Champion Sec & Build           ║")
     print("║  [2] Multi-Extract (Coklu Build)    ║")
     print("║  [3] Extract All (Tum Sampiyonlar)  ║")
-    print("║  [4] Ayarlar                        ║")
-    print("║  [5] Hash Yenile                    ║")
-    print("║  [6] Cikis                          ║")
+    print("║  [4] Fantome/WAD Aktar -> skin0     ║")
+    print("║  [5] Ayarlar                        ║")
+    print("║  [6] Hash Yenile                    ║")
+    print("║  [7] Cikis                          ║")
     print("╚═════════════════════════════════════╝")
     return input("  > ").strip()
 
@@ -1707,6 +2507,8 @@ def main():
                     help="--extract-all ile: haric tutulacak sampiyonlar (or. 'zed, lee sin')")
     ap.add_argument("--ltk-import", dest="ltk_import", action="store_true",
                     help="Build edilenleri LTK'ya sampiyon klasoruyle otomatik ekle")
+    ap.add_argument("--import-mod", dest="import_mod", default=None,
+                    help="Harici .fantome/.wad dosyasini skin0'a cevirip /Extracted'e cikar")
     ap.add_argument("--refresh-hashes", action="store_true", help="Hash tablolarini yenile")
     args, _ = ap.parse_known_args()
 
@@ -1722,7 +2524,7 @@ def main():
         if detected:
             CONFIG["league"] = detected
 
-    headless = bool(args.champion or args.list or args.extract_all)
+    headless = bool(args.champion or args.list or args.extract_all or args.import_mod)
 
     print("=" * 43)
     print("  Rahasya Extraction Tool  v3")
@@ -1733,6 +2535,14 @@ def main():
     load_hashes(args.refresh_hashes)
 
     if headless:
+        if args.import_mod:
+            champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
+            out_dir = Path(CONFIG["out"])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            res = convert_external_mod(Path(args.import_mod), out_dir, champions_dir)
+            if res and CONFIG.get("ltk_auto"):
+                maybe_ltk_import([res])
+            sys.exit(0 if res else 1)
         if args.extract_all and not args.champion:
             champions_dir = Path(CONFIG["league"]) / "Game" / "DATA" / "FINAL" / "Champions"
             if not champions_dir.exists():
@@ -1784,12 +2594,16 @@ def main():
             extract_all_mode(champions_dir, out_dir)
 
         elif choice == "4":
-            show_settings()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            import_mod_mode(champions_dir, out_dir)
 
         elif choice == "5":
-            load_hashes(refresh=True)
+            show_settings()
 
         elif choice == "6":
+            load_hashes(refresh=True)
+
+        elif choice == "7":
             print("\n  Cikiliyor...\n")
             break
 
